@@ -4,6 +4,8 @@
 #SBATCH --mem=32G
 #SBATCH -t 12:00:00
 #SBATCH -o slurm-%j.out
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=xindi.lin@yale.edu
 
 cd "$SLURM_SUBMIT_DIR"
 
