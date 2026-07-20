@@ -268,9 +268,24 @@ cv_hyperparam_group_for_m <- function(m, lambda_lst, kernel_bw_mult_lst, data, k
     grid$mcc[g] <- mean(vapply(fold_metrics, `[[`, numeric(1), "mcc"))
     grid$two_sided_f1[g] <- mean(vapply(fold_metrics, `[[`, numeric(1), "two_sided_f1"))
 
+    # Flag NA or suspiciously degenerate (exactly 0 or 1) metric values -- these usually
+    # mean a fold ended up with a degenerate confusion matrix (e.g. every held-out
+    # prediction landed in the same class), not a genuine, well-behaved CV result. Printed
+    # via cat() rather than warning(), since warning() isn't reliably surfaced in the log
+    # from inside a forked mclapply worker.
+    metric_vals <- c(acc = grid$acc[g], mcc = grid$mcc[g], two_sided_f1 = grid$two_sided_f1[g])
+    suspicious <- names(metric_vals)[is.na(metric_vals) | metric_vals %in% c(0, 1)]
+    if (length(suspicious) > 0) {
+      cat(sprintf("WARNING%s: suspicious metric value(s) for combo %d/%d (lambda=%.2f, kernel_bw_mult=%.2f): %s\n",
+                  if (is.null(progress_label)) "" else paste0(" [", progress_label, "]"),
+                  g, nrow(grid), lambda, grid$kernel_bw_mult[g],
+                  paste(sprintf("%s=%s", suspicious, round(metric_vals[suspicious], 4)), collapse = ", ")))
+    }
+
     if (!is.null(progress_label)) {
-      cat(sprintf("%s: combo %d/%d done (lambda=%.2f, kernel_bw_mult=%.2f) -> cv mcc=%.4f\n",
-                  progress_label, g, nrow(grid), lambda, grid$kernel_bw_mult[g], grid$mcc[g]))
+      cat(sprintf("%s: combo %d/%d done (lambda=%.2f, kernel_bw_mult=%.2f) -> acc=%.4f, mcc=%.4f, two_sided_f1=%.4f\n",
+                  progress_label, g, nrow(grid), lambda, grid$kernel_bw_mult[g],
+                  grid$acc[g], grid$mcc[g], grid$two_sided_f1[g]))
     }
   }
 
