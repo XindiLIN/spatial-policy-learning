@@ -4,6 +4,8 @@
 #SBATCH --mem=8G
 #SBATCH -t 04:00:00
 #SBATCH -o slurm-install-%j.out
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=xindi.lin@yale.edu
 
 cd "$SLURM_SUBMIT_DIR"
 
