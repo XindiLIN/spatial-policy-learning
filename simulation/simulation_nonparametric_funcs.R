@@ -229,7 +229,8 @@ fit_one_fold <- function(k_train, k_holdout, data_ft, T_holdout, Y_holdout,
 cv_hyperparam_group_for_m <- function(m, lambda_lst, kernel_bw_mult_lst, data, kernel_design_matrix,
                                        kernel_bw_baseline, fold_id, n_folds = 5,
                                        threshold_val, trt_bounds = c(-4,4), clip_epsilon = 30,
-                                       krige_values, gps_est, resids, smoothers, cumint_smoothers){
+                                       krige_values, gps_est, resids, smoothers, cumint_smoothers,
+                                       progress_label = NULL){
 
   gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
   rbf <- rbfdot(sigma = 1/(gamma^2))
@@ -266,6 +267,11 @@ cv_hyperparam_group_for_m <- function(m, lambda_lst, kernel_bw_mult_lst, data, k
     grid$acc[g] <- mean(vapply(fold_metrics, `[[`, numeric(1), "acc"))
     grid$mcc[g] <- mean(vapply(fold_metrics, `[[`, numeric(1), "mcc"))
     grid$two_sided_f1[g] <- mean(vapply(fold_metrics, `[[`, numeric(1), "two_sided_f1"))
+
+    if (!is.null(progress_label)) {
+      cat(sprintf("%s: combo %d/%d done (lambda=%.2f, kernel_bw_mult=%.2f) -> cv mcc=%.4f\n",
+                  progress_label, g, nrow(grid), lambda, grid$kernel_bw_mult[g], grid$mcc[g]))
+    }
   }
 
   grid$m <- m

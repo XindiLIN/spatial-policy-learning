@@ -196,14 +196,21 @@ cv_task_grid <- expand.grid(thr_idx = seq_len(nrow(thr_grid)), m = m_lst)
 
 run_one_cv_group <- function(thr_idx, m){
   ctx <- thr_ctxs[[thr_idx]]
+  label <- sprintf("seed=%d | threshold_quantile=%.2f | m=%.2f", ctx$seed_value, ctx$threshold_quantile, m)
+  n_combos <- length(lambda_lst) * length(kernel_bw_mult_lst)
+  cat(sprintf("%s: starting (%d combos x %d folds = %d fits)\n", label, n_combos, n_folds, n_combos * n_folds))
+
   result <- cv_hyperparam_group_for_m(m = m, lambda_lst = lambda_lst, kernel_bw_mult_lst = kernel_bw_mult_lst,
                                        data = ctx$data, kernel_design_matrix = ctx$kernel_design_matrix,
                                        kernel_bw_baseline = ctx$kernel_bw_baseline,
                                        fold_id = ctx$fold_id, n_folds = n_folds,
                                        threshold_val = ctx$threshold_val, trt_bounds = c(-4,4), clip_epsilon = 30,
                                        krige_values = ctx$krige_values, gps_est = ctx$gps_est, resids = ctx$resids,
-                                       smoothers = ctx$smoothers, cumint_smoothers = ctx$cumint_smoothers)
+                                       smoothers = ctx$smoothers, cumint_smoothers = ctx$cumint_smoothers,
+                                       progress_label = label)
   result$thr_idx <- thr_idx
+
+  cat(sprintf("%s: finished\n", label))
   result
 }
 
