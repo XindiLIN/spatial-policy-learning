@@ -5,6 +5,8 @@
 #SBATCH -t 04:00:00
 #SBATCH -o slurm-install-%j.out
 
+cd "$SLURM_SUBMIT_DIR"
+
 module reset
 module load R/4.4.2-gfbf-2024a
 Rscript simulation/install_packages.R
