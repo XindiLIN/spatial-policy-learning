@@ -11,7 +11,8 @@ dir.create(lib_dir, recursive = TRUE, showWarnings = FALSE)
 .libPaths(lib_dir)
 
 install.packages(
-  c("tidymodels","tidyverse","SuperLearner","dplyr","ggplot2","GpGp","Metrics","yardstick","glmnet","kernlab"),
+  c("tidymodels","tidyverse","SuperLearner","dplyr","ggplot2","GpGp","Metrics","yardstick","glmnet","kernlab",
+    "fields","sp","gstat","caret","e1071","recipes"),
   lib = lib_dir,
   repos = "https://cloud.r-project.org"
 )
