@@ -1,0 +1,1108 @@
+---
+title: "nitrate_regional_cross_validation"
+author: "Xindi Lin"
+date: "2025-10-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidymodels)
+library(ranger)
+library(SuperLearner)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(WeightIt)
+library(GpGp)
+library(Metrics)
+library(rnaturalearth)
+library(ggplot2)
+library(see)
+library(yardstick)
+library(xgboost)
+library(glmnet)
+library(kernlab)
+library(glmnet)
+library(numDeriv)
+library(MASS)
+library(e1071)
+library(WeightIt)
+library(caret)
+```
+
+```{r}
+source('data_generation.R')
+source('funcs_kriging.R')
+source('loss_functions.R')
+source('loss_functions_RKHS.R')
+source('miscellaneous.R')
+```
+
+
+### preparation
+
+#### load regional data and preprocess
+
+
+```{r}
+file_path <- "/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_with_covar_median_well.csv"
+## we will use the one with the proportion
+# file_path <- "/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_latest_with_covar_landuseProp_median_well"
+command <- paste("brctl download", shQuote(file_path))
+system(command)
+data <- read.csv("/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_with_covar_median_well.csv")
+```
+
+remove zero-inflated
+```{r}
+data <- data[data$concentration_plus_median!=0.5,]
+```
+
+choose area
+
+```{r}
+data$area = ""
+
+indices_central <- data$County %in% c("Wood", "Portage", "Waupaca", "Juneau", "Adams", "Waushara", "Marquette", "Green Lake")
+data[indices_central, "area"] = "Central"
+
+indices_westCentral <- data$County %in% c("Buffalo", "Trempealeau", "La Crosse", "Monroe")
+data[indices_westCentral, "area"] = "West Central"
+
+indices_southCentral <- data$County %in% c("Columbia", "Dodge", "Dane", "Jefferson", "Green", "Rock")
+data[indices_southCentral, "area"] = "South Central"
+
+indices_eastCentral <- data$County %in% c("Outagamie", "Winnebago", "Door", "Fond du Lac", "Brown", "Calumet","Sheboygan","Manitowoc","Kewaunee")
+data[indices_eastCentral, "area"] = "East Central"
+
+indices_southWest <- data$County %in% c("Vernon", "Crawford", "Grant", "Richland", "Sauk", "Iowa","Lafayette")
+data[indices_southWest, "area"] = "South West"
+
+indices_southEast <- data$County %in% c("Washington", "Waukesha", "Walworth", "Ozaukee", "Milwaukee", "Racine","Kenosha")
+data[indices_southEast, "area"] = "South East"
+```
+
+```{r}
+data <- data[data$area == "East Central",]
+```
+
+add log transformation
+
+```{r}
+data$logWellDepth = log(data$WellDepth)
+data$logconcentration_plus_median = log(data$concentration_plus_median)
+```
+
+```{r}
+set.seed(1998)
+
+data_full <- data
+train_indices <- createDataPartition(data$logconcentration_plus_median, list = FALSE, p = 0.7) # from caret package
+data <- data_full[train_indices,]
+data_test <- data_full[-train_indices,]
+```
+
+we try new partition method such that the distribution of nitrate level are the same
+
+```{r}
+set.seed(1998)
+# 2. First Split: Training (60%) vs. Temp (40%)
+# Create indices for the training set. 'p = 0.6' means 60% of the data.
+data_full <- data
+train_indices <- createDataPartition(data_full$logconcentration_plus_median, p = 0.6, list = FALSE, times = 1)
+# Separate the training data and the temporary data
+data_train <- data_full[train_indices, ]
+data_tmp  <- data_full[-train_indices, ]
+
+# 3. Second Split: Validation (50% of Temp) vs. Test (50% of Temp)
+# Split the temporary data in half to get validation and test sets.
+# Note: We stratify on the 'y' variable of the temp_data.
+validation_indices <- createDataPartition(data_tmp$logconcentration_plus_median, p = 0.5, list = FALSE, times = 1)
+
+# Separate the validation and test data
+data_validation <- data_tmp[validation_indices, ]
+data_test <- data_tmp[-validation_indices, ]
+```
+
+```{r}
+dim(data_train)
+dim(data_validation)
+dim(data_test)
+```
+
+
+#### Estimate nuisance parameter
+
+##### OR RKHS
+
+```{r}
+OR_covariate_names <- c("logWellDepth","WellUse","crop_type_combine","drainagecl","precipitation","cafolog","StaticLevel")
+```
+
+```{r}
+design_matrix <- model.matrix(~ . , data = data_train[, OR_covariate_names])[,-1]
+design_matrix_test <- model.matrix(~ . , data = data_test[, OR_covariate_names])[,-1]
+design_matrix_validation <- model.matrix(~ . , data = data_validation[, OR_covariate_names])[,-1]
+```
+
+```{r}
+svm_auto <- svm(x = design_matrix, y = data_train$logconcentration_plus_median, type='nu-regression')
+```
+
+```{r}
+gpfit_RKHS = GpGp::fit_model(svm_auto$residuals,
+                        locs = data_train[,c("longitude", "latitude")],
+                        covfun_name = "matern_sphere")
+
+krige_values_RKHS <- leave_one_out_kriging(locs = data_train[,c("longitude", "latitude")], 
+                                      y_obs = svm_auto$residuals, 
+                                      gp_model = gpfit_RKHS$covfun_name,
+                                      gp_params = gpfit_RKHS$covparms,
+                                      order = c("coordinate")) 
+
+krige_values_validation_RKHS <- GpGp::predictions(fit = gpfit_RKHS, 
+                      locs_pred = data_validation[,c("longitude", "latitude")], 
+                      X_pred = rep(1,nrow(data_validation)))
+
+krige_values_test_RKHS <- GpGp::predictions(fit = gpfit_RKHS, 
+                      locs_pred = data_test[,c("longitude", "latitude")], 
+                      X_pred = rep(1,nrow(data_test)))
+```
+
+```{r}
+cat('Test rMSE: with kriging: ')
+cat(Metrics::rmse(log(data_test$concentration_plus_median), predict(svm_auto, newdata = design_matrix_test) + krige_values_test_RKHS))
+cat('\n')
+cat('Test rMSE: No kriging: ')
+cat(Metrics::rmse(log(data_test$concentration_plus_median), predict(svm_auto, newdata = design_matrix_test)))
+cat('\n')
+
+cat('Validation rMSE: with kriging: ')
+cat(Metrics::rmse(log(data_validation$concentration_plus_median), predict(svm_auto, newdata = design_matrix_validation) + krige_values_validation_RKHS))
+cat('\n')
+cat('Validation rMSE: No kriging: ')
+cat(Metrics::rmse(log(data_validation$concentration_plus_median), predict(svm_auto, newdata = design_matrix_validation)))
+cat('\n')
+
+cat('Training rMSE: with kriging: ')
+cat(Metrics::rmse(log(data_train$concentration_plus_median), predict(svm_auto, newdata = design_matrix) + krige_values_RKHS))
+cat('\n')
+cat('Training rMSE: No kriging: ')
+cat(Metrics::rmse(log(data_train$concentration_plus_median), predict(svm_auto, newdata = design_matrix)))
+cat('\n')
+```
+
+##### Covariate Balancing Weight
+
+```{r}
+weights_cbps <- weightit(logWellDepth ~ StaticLevel+WellUse+crop_type_combine+drainagecl+precipitation+cafolog, 
+                         data = data_train, method = "cbps")
+```
+
+#### Compute OR smoothers: RKHS
+
+```{r}
+boundary_tol <- 0
+depth_range <- c(min(data_train$logWellDepth) - boundary_tol, max(data_train$logWellDepth) + boundary_tol)
+depth_range
+```
+
+for training 
+
+```{r}
+# xgboost use the design matrix
+cf_predictions_RKHS <- precompute_cf_predictions(data_obs = design_matrix, 
+                              fit_outcome = svm_auto,
+                              treatment_range = depth_range,
+                              treatment_step = 0.02,
+                              treatment_name = "logWellDepth")
+```
+
+```{r}
+cf_predictions_RKHS <- isotomic_correction(treatment_grid = cf_predictions_RKHS$treatment_values,
+                                          pred_matrix_cf = cf_predictions_RKHS$pred_matrix)
+```
+
+```{r}
+smoothers_RKHS <- make_prediction_smoothers(treatment_grid = cf_predictions_RKHS$treatment_values,
+                                            pred_matrix_cf = cf_predictions_RKHS$pred_matrix,
+                                            # smooth_method = "gam",
+                                            smooth_method = "smooth.spline",
+                                            # smooth_method = "splinefun",
+                                            spar = NULL)
+```
+
+```{r}
+cumint_smoothers_RKHS <- make_cumint_smoothers(treatment_grid = cf_predictions_RKHS$treatment_values,
+                                            pred_matrix_cf = cf_predictions_RKHS$pred_matrix,
+                                         # smooth_method = "splinefun",
+                                         # smooth_method = "gam",
+                                         smooth_method = "smooth.spline",
+                                         spar = NULL)
+```
+
+for test 
+
+```{r}
+# xgboost use the design matrix
+cf_predictions_test_RKHS <- precompute_cf_predictions(data_obs = design_matrix_test, 
+                              fit_outcome = svm_auto,
+                              treatment_range = depth_range,
+                              treatment_step = 0.02,
+                              treatment_name = "logWellDepth")
+```
+
+```{r}
+cf_predictions_test_RKHS <- isotomic_correction(treatment_grid = cf_predictions_test_RKHS$treatment_values,
+                                          pred_matrix_cf = cf_predictions_test_RKHS$pred_matrix)
+```
+
+```{r}
+smoothers_test_RKHS <- make_prediction_smoothers(treatment_grid = cf_predictions_test_RKHS$treatment_values,
+                                            pred_matrix_cf = cf_predictions_test_RKHS$pred_matrix,
+                                            smooth_method = "smooth.spline",
+                                            spar = NULL)
+```
+
+```{r}
+cumint_smoothers_test_RKHS <- make_cumint_smoothers(treatment_grid = cf_predictions_test_RKHS$treatment_values,
+                                               pred_matrix_cf = cf_predictions_test_RKHS$pred_matrix,
+                                               # smooth_method = "splinefun",
+                                               smooth_method = "smooth.spline",
+                                               spar = NULL)
+```
+
+for validation
+
+```{r}
+# xgboost use the design matrix
+cf_predictions_validation_RKHS <- precompute_cf_predictions(data_obs = design_matrix_validation, 
+                              fit_outcome = svm_auto,
+                              treatment_range = depth_range,
+                              treatment_step = 0.02,
+                              treatment_name = "logWellDepth")
+```
+
+```{r}
+cf_predictions_validation_RKHS <- isotomic_correction(treatment_grid = cf_predictions_validation_RKHS$treatment_values,
+                                          pred_matrix_cf = cf_predictions_validation_RKHS$pred_matrix)
+```
+
+```{r}
+smoothers_validation_RKHS <- make_prediction_smoothers(treatment_grid = cf_predictions_validation_RKHS$treatment_values,
+                                            pred_matrix_cf = cf_predictions_validation_RKHS$pred_matrix,
+                                            smooth_method = "smooth.spline",
+                                            spar = NULL)
+```
+
+```{r}
+cumint_smoothers_validation_RKHS <- make_cumint_smoothers(treatment_grid = cf_predictions_validation_RKHS$treatment_values,
+                                               pred_matrix_cf = cf_predictions_validation_RKHS$pred_matrix,
+                                               # smooth_method = "splinefun",
+                                               smooth_method = "smooth.spline",
+                                               spar = NULL)
+```
+
+##### Visualizetion of OR Smoothers
+
+```{r}
+i <- 11
+# when i = 20, it decrease first then increase, 
+plot(seq(0,8,length.out = 100), sapply(seq(0,8,length.out = 100), function(knot) {smoothers_RKHS[[i]](knot)}), main = 'Smooth')
+plot(cf_predictions_RKHS$treatment_values, sapply(cf_predictions_RKHS$treatment_values, function(knot) {smoothers_RKHS[[i]](knot)}), main = 'Smoothers RKHS')
+
+plot(cf_predictions_RKHS$treatment_values, sapply(cf_predictions_RKHS$treatment_values, function(knot) {cumint_smoothers_RKHS[[i]](knot)}), main = 'cumint Smoothers RKHS')
+
+plot(cf_predictions_RKHS$treatment_values,  cf_predictions_RKHS$pred_matrix[,i], main = 'Non-smooth original')
+```
+
+```{r}
+mean(sapply(1:nrow(data), function(i){smoothers_RKHS[[i]](depth_range[1])>= log(5)}))
+mean(sapply(1:nrow(data), function(i){smoothers_RKHS[[i]](depth_range[1]) + krige_values_RKHS[i] >= log(5)}))
+```
+
+```{r}
+mean(data_train$logconcentration_plus_median >= log(5))
+mean(data_train$logconcentration_plus_median >= log(2))
+```
+
+```{r}
+mean(data_train$logconcentration_plus_median >= log(5))
+mean(data_test$logconcentration_plus_median >= log(5))
+```
+
+
+#### Indirect Method
+
+```{r}
+threshold_val = log(5)
+```
+
+```{r}
+indirect_policy_RKHS <- compute_indirect_policy(smoothers = smoothers_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = krige_values_RKHS, spatial = TRUE)
+
+indirect_policy_validation_RKHS <- compute_indirect_policy(smoothers = smoothers_validation_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = krige_values_validation_RKHS, spatial = TRUE)
+
+indirect_policy_test_RKHS <- compute_indirect_policy(smoothers = smoothers_test_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = krige_values_test_RKHS, spatial = TRUE)
+```
+
+```{r}
+Metrics::accuracy(log(data_train$concentration_plus_median) > threshold_val, indirect_policy_RKHS > data_train$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data_train$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_RKHS > data_train$logWellDepth))
+```
+
+```{r}
+Metrics::accuracy(log(data_test$concentration_plus_median) > threshold_val, indirect_policy_test_RKHS > data_test$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data_test$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_test_RKHS > data_test$logWellDepth))
+```
+
+```{r}
+Metrics::accuracy(log(data_validation$concentration_plus_median) > threshold_val, indirect_policy_validation_RKHS > data_validation$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data_validation$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_validation_RKHS > data_validation$logWellDepth))
+```
+
+#### initialization
+
+##### one starting point
+
+```{r}
+# we use the following one for now
+GPS_covariate_names <- c("StaticLevel","WellUse","crop_type_combine","drainagecl","precipitation","cafolog")
+kernel_design_matrix <- model.matrix(~ . , data = cbind(data_train[, GPS_covariate_names], U = krige_values_RKHS))[,-1]
+kernel_design_matrix_test <- model.matrix(~ . , data = cbind(data_test[, GPS_covariate_names], U = krige_values_test_RKHS))[,-1]
+
+train_means <- colMeans(kernel_design_matrix)
+train_sds <- apply(kernel_design_matrix, 2, sd)
+
+kernel_design_matrix <- scale(kernel_design_matrix)
+kernel_design_matrix_test <- scale(kernel_design_matrix_test, center = train_means, scale = train_sds)
+```
+
+```{r}
+resids <- data_train$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+scaled_resids <- resids * weights_cbps$weights
+# plot(scaled_resids)
+kernel_bw <- 1.06 * sd(data_train$logWellDepth) *nrow(data_train)^(-1/5)
+```
+
+
+```{r}
+# initial_policy <- cbind(rep(1,nrow(data)), diag(nrow(data))) %*% params_initial_glmnet
+initial_policy <- rep(mean(depth_range), nrow(data))
+
+direct_individual <- c()
+for(i in 1:nrow(data)){
+  cat(i,'-th sample\n')
+  direct_trt <- optim(# par = indirect_policy_RKHS[sub_indices[i]],
+                      # par = mean(depth_range),
+                      # par = depth_range[1],
+                      par = initial_policy[i],
+                      fn = compute_total_loss_smooth,
+                      subject_idx = i,
+                      T = data_train$logWellDepth,
+                      krige_adjust = krige_values_RKHS,
+                      outcome_resid = resids,
+                      propensity_est = 1/weights_cbps$weights,
+                      cumint_smoothers = cumint_smoothers_RKHS, 
+                      trt_bounds = depth_range,
+                      threshold_val = log(5), 
+                      kernel_bw = kernel_bw, 
+                      clip_epsilon = clip_epsilon ,
+                      surrogate_type = "Gaussian",
+                      loss_type = "db",
+                      method = "L-BFGS-B", 
+                      control = list(maxit = 100, trace = 1))
+  # cat('optim trt: ', direct_trt$par,'\n\n')
+  direct_individual <- c(direct_individual, direct_trt$par)
+  # cat('indirect RKHS: ',indirect_policy_RKHS[sub_indices[i]],'\n\n')
+  # cat('indirect DB: ', indirect_policy_DB[sub_indices[i]],'\n\n')
+}
+
+```
+
+```{r}
+Metrics::accuracy(log(data_train$concentration_plus_median) > threshold_val, direct_individual > data_train$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data_train$concentration_plus_median) > threshold_val), estimate = as.factor( direct_individual > data_train$logWellDepth))
+```
+
+```{r}
+plot(indirect_policy_RKHS,direct_individual)
+```
+
+##### multi-starting point
+
+```{r}
+clip_epsilon <- 1
+resids <- data_train$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+```
+
+
+```{r}
+kernel_bw <- 1.06 * sd(data_train$logWellDepth) *nrow(data_train)^(-1/5)
+direct_individual_multi_initial <- c()
+
+initial_value_set <- c(depth_range[1] - 1, mean(depth_range), depth_range[2] + 1)
+
+for(i in 1:nrow(data_train)){
+  cat(i,'-th sample\n')
+  tmp_loss <- 1e4
+  for(initial_point in initial_value_set){
+    direct_trt <- optim(par = initial_point,
+                        fn = compute_total_loss_smooth,
+                        subject_idx = i,
+                        T = data_train$logWellDepth,
+                        krige_adjust = krige_values_RKHS,
+                        outcome_resid = resids,
+                        propensity_est = 1/weights_cbps$weights,
+                        cumint_smoothers = cumint_smoothers_RKHS, 
+                        trt_bounds = depth_range,
+                        threshold_val = log(5), 
+                        kernel_bw = kernel_bw, 
+                        clip_epsilon = clip_epsilon ,
+                        surrogate_type = "Gaussian",
+                        loss_type = "db",
+                        method = "L-BFGS-B", 
+                        control = list(maxit = 300, trace = 1))
+    if(direct_trt$value < tmp_loss){
+      tmp_loss <- direct_trt$value
+      tmp_direct_policy <- direct_trt$par
+    }
+  }
+  direct_individual_multi_initial <- c(direct_individual_multi_initial, tmp_direct_policy)
+}
+
+```
+
+```{r}
+Metrics::accuracy(log(data_train$concentration_plus_median) > threshold_val, direct_individual_multi_initial > data_train$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data_train$concentration_plus_median) > threshold_val), estimate = as.factor( direct_individual_multi_initial > data_train$logWellDepth))
+```
+
+
+### cross-validation with validation/test set
+
+first we build grid for hyper-parameter, the metrics that we use are the accuracy and mcc in validation set
+
+```{r}
+# kernel_bw_grid <- c(0.5 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5),  1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5), 1.5 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5), 2 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5))
+# 
+# lambda_grid <- c(0,1,2,5)
+# 
+# m_grid <- c(-2,-1.5,-1,-0.5, 0)
+
+kernel_bw_baseline <- 1.06 * sd(data_train$logWellDepth) *nrow(data_train)^(-1/5)
+hyperparameters <- list(
+  kernel_bw = c(0.5 * kernel_bw_baseline,  1 * kernel_bw_baseline, 1.5 * kernel_bw_baseline, 2 * kernel_bw_baseline),
+  lambda = c(0,1,2,5),
+  m = c(-2,-1.5,-1,-0.5, 0)
+)
+
+param_grid <- expand.grid(hyperparameters)
+
+param_grid$acc_initial <- NA
+param_grid$mcc_initial <- NA
+param_grid$acc_validation <- NA
+param_grid$mcc_validation <- NA
+param_grid$acc_test <- NA
+param_grid$mcc_test <- NA
+
+# View the grid
+print(param_grid)
+```
+
+```{r}
+GPS_covariate_names <- c("StaticLevel","WellUse","crop_type_combine","drainagecl","precipitation","cafolog")
+# one type of kernel matrix using U as covariats
+kernel_design_matrix <- model.matrix(~ . , data = cbind(data_train[, GPS_covariate_names], U = krige_values_RKHS))[,-1]
+kernel_design_matrix_test <- model.matrix(~ . , data = cbind(data_test[, GPS_covariate_names], U = krige_values_test_RKHS))[,-1]
+kernel_design_matrix_validation <- model.matrix(~ . , data = cbind(data_validation[, GPS_covariate_names], U = krige_values_validation_RKHS))[,-1]
+```
+
+
+```{r}
+for(i in 1:nrow(param_grid)){
+  m <- param_grid$m[i]
+  lambda <- param_grid$lambda[i]
+  kernel_bw <- param_grid$kernel_bw[i]
+  
+  result <- real_data_cross_validation(m = m, 
+                             lambda = lambda, 
+                             kernel_bw = kernel_bw, 
+                             kernel_design_matrix = kernel_design_matrix, 
+                             kernel_design_matrix_test = kernel_design_matrix_test,
+                             kernel_design_matrix_validation = kernel_design_matrix_validation)
+      
+  param_grid$acc_initial[i] <- result$acc_initial
+  param_grid$mcc_initial[i] <- result$mcc_initial
+  param_grid$acc_validation[i] <- result$acc_validation
+  param_grid$mcc_validation[i] <- result$mcc_validation
+  param_grid$acc_test[i] <- result$acc_test
+  param_grid$mcc_test[i] <- result$mcc_test
+  
+  # Optional: Print progress to the console
+  cat(sprintf("Finished run %d/%d | m=%.2f, lambda=%.2f, bw=%.2f | Val MCC: %.4f\n | Test MCC: %.4f\n", 
+              i, nrow(param_grid), m, lambda, kernel_bw, result$mcc_validation, result$mcc_test))    
+     
+}
+```
+
+
+
+### Cross-Validation
+
+#### Cross-Validation for non-DC algorithm
+
+Cross-validation for ##### Optimize Sum of DB loss: non-DC algorithm, non-identity-kernel, whole dataset##### on policy_learning_nitrate_regional_test.rmd
+
+##### kernel bandwidth
+
+```{r}
+for(m in c(-1.7,-1.6,-1.5,-1.4,-1.3)){
+  cat("m is: ",m,'\n')
+  gamma <- 2^(m) * median(rdist(kernel_design_matrix))
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+  k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+  
+  k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+  k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+
+  initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual, alpha = 0, lambda = 0)
+  params_initial_glmnet <- coef(initial_glmnet)
+  params_initial_glmnet <- as.numeric(params_initial_glmnet)
+  
+  
+  print_acc_mcc(T = data_test$logWellDepth, 
+                Y = data_test$logconcentration_plus_median, 
+                policy = k_matrix_test %*% kernel_optim_trt_DB$par, 
+                threshold_val = log(5))
+
+}
+```
+
+We see that -1.5 is the best
+
+##### RKHS coefficient penalty
+
+```{r}
+for(lambda in c(0, 0.25, 0.5, 1, 2)){
+  cat("lambda is: ",lambda,'\n')
+  m <- -1.5
+  gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+  k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+  
+  k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+  k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+
+  initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual, alpha = 0, lambda = 0)
+  params_initial_glmnet <- coef(initial_glmnet)
+  params_initial_glmnet <- as.numeric(params_initial_glmnet)
+  
+  kernel_optim_trt_DB <- optim(par = params_initial_glmnet, 
+      fn = compute_total_loss_smooth_RKHS,
+      gr = d_compute_total_loss_smooth_RKHS,
+      K = k_matrix,
+      # K = cbind(rep(1,nrow(data)), diag(nrow(data))),
+      # K = diag(nrow(data)),
+      T = data_train$logWellDepth,
+      krige_adjust = krige_values_RKHS,
+      outcome_resid = resids,
+      propensity_est = 1/weights_cbps$weights,
+      lambda = lambda, 
+      smoothers = smoothers_RKHS, 
+      cumint_smoothers = cumint_smoothers_RKHS, 
+      trt_bounds = depth_range,
+      threshold_val = log(5), 
+      kernel_bw = kernel_bw, 
+      clip_epsilon = clip_epsilon,
+      surrogate_type = "Gaussian",
+      loss_type = "db",
+      method = "L-BFGS-B",
+      control = list(maxit = 1000, trace = 3)) 
+  
+  print_acc_mcc(T = data_test$logWellDepth, 
+              Y = data_test$logconcentration_plus_median, 
+              policy = k_matrix_test %*% kernel_optim_trt_DB$par, 
+              threshold_val = log(5))
+  
+
+}
+```
+
+lambda similar to 0.25, test acc is 0.572922 
+
+##### sorrogate kernel bandwidth
+
+```{r}
+
+kernel_bw <- 
+
+for(lambda in c(0, 0.25, 0.5, 1, 2)){
+  cat("lambda is: ",lambda,'\n')
+  m <- -1.5
+  gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+  k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+  
+  k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+  k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+
+  initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual, alpha = 0, lambda = 0)
+  params_initial_glmnet <- coef(initial_glmnet)
+  params_initial_glmnet <- as.numeric(params_initial_glmnet)
+  
+  kernel_optim_trt_DB <- optim(par = params_initial_glmnet, 
+      fn = compute_total_loss_smooth_RKHS,
+      gr = d_compute_total_loss_smooth_RKHS,
+      K = k_matrix,
+      # K = cbind(rep(1,nrow(data)), diag(nrow(data))),
+      # K = diag(nrow(data)),
+      T = data_train$logWellDepth,
+      krige_adjust = krige_values_RKHS,
+      outcome_resid = resids,
+      propensity_est = 1/weights_cbps$weights,
+      lambda = lambda, 
+      smoothers = smoothers_RKHS, 
+      cumint_smoothers = cumint_smoothers_RKHS, 
+      trt_bounds = depth_range,
+      threshold_val = log(5), 
+      kernel_bw = kernel_bw, 
+      clip_epsilon = clip_epsilon,
+      surrogate_type = "Gaussian",
+      loss_type = "db",
+      method = "L-BFGS-B",
+      control = list(maxit = 1000, trace = 3)) 
+  
+  print_acc_mcc(T = data_test$logWellDepth, 
+              Y = data_test$logconcentration_plus_median, 
+              policy = k_matrix_test %*% kernel_optim_trt_DB$par, 
+              threshold_val = log(5))
+  
+
+}
+```
+
+##### (Optimal) for non-DC algorithm
+
+```{r}
+# cat("lambda is: ",lambda,'\n')
+m <- -1.5
+lambda <- 0.25
+gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+rbf <- rbfdot(sigma = 1/(gamma^2))
+k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+
+k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+
+initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual, alpha = 0, lambda = 0)
+params_initial_glmnet <- coef(initial_glmnet)
+params_initial_glmnet <- as.numeric(params_initial_glmnet)
+
+kernel_optim_trt_DB <- optim(par = params_initial_glmnet, 
+    fn = compute_total_loss_smooth_RKHS,
+    gr = d_compute_total_loss_smooth_RKHS,
+    K = k_matrix,
+    # K = cbind(rep(1,nrow(data)), diag(nrow(data))),
+    # K = diag(nrow(data)),
+    T = data_train$logWellDepth,
+    krige_adjust = krige_values_RKHS,
+    outcome_resid = resids,
+    propensity_est = 1/weights_cbps$weights,
+    lambda = lambda, 
+    smoothers = smoothers_RKHS, 
+    cumint_smoothers = cumint_smoothers_RKHS, 
+    trt_bounds = depth_range,
+    threshold_val = log(5), 
+    kernel_bw = kernel_bw, 
+    clip_epsilon = clip_epsilon,
+    surrogate_type = "Gaussian",
+    loss_type = "db",
+    method = "L-BFGS-B",
+    control = list(maxit = 1000, trace = 3)) 
+
+print_acc_mcc(T = data_test$logWellDepth, 
+            Y = data_test$logconcentration_plus_median, 
+            policy = k_matrix_test %*% kernel_optim_trt_DB$par, 
+            threshold_val = log(5))
+  
+```
+
+The loss function has to be bounded. Smoothness of L_minus
+
+Stochastic gradient descent.
+Many non-convex algorithm: different advantages and drawbacks.
+
+Maybe try CXVR. 
+
+
+#### Cross-Validation for DC algorithm
+
+##### build covariate matrix
+
+using kriging values as covariate
+
+```{r}
+# we use the following one for now
+GPS_covariate_names <- c("StaticLevel","WellUse","crop_type_combine","drainagecl","precipitation","cafolog")
+# one type of kernel matrix using U as covariats
+kernel_design_matrix <- model.matrix(~ . , data = cbind(data_train[, GPS_covariate_names], U = krige_values_RKHS))[,-1]
+kernel_design_matrix_test <- model.matrix(~ . , data = cbind(data_test[, GPS_covariate_names], U = krige_values_test_RKHS))[,-1]
+
+train_means <- colMeans(kernel_design_matrix)
+train_sds <- apply(kernel_design_matrix, 2, sd)
+
+kernel_design_matrix <- scale(kernel_design_matrix)
+kernel_design_matrix_test <- scale(kernel_design_matrix_test, center = train_means, scale = train_sds)
+```
+
+```{r}
+# the other type of kernel matrix using coordinates
+GPS_covariate_names <- c("StaticLevel","WellUse","crop_type_combine","drainagecl","precipitation","cafolog","latitude","longitude")
+kernel_design_matrix <- model.matrix(~ . , data = data_train[, GPS_covariate_names])[,-1]
+kernel_design_matrix_test <- model.matrix(~ . , data = data_test[, GPS_covariate_names])[,-1]
+
+train_means <- colMeans(kernel_design_matrix)
+train_sds <- apply(kernel_design_matrix, 2, sd)
+
+kernel_design_matrix <- scale(kernel_design_matrix)
+kernel_design_matrix_test <- scale(kernel_design_matrix_test, center = train_means, scale = train_sds)
+```
+
+
+##### Cross-Validation for RKHS kernel bandwidth in initialization
+
+```{r}
+for(m in c(-2,-1.5,-1,-0.5)){
+  cat('value of m is ',m,'\n')
+  gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+  k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+  
+  k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+  k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+  initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial, alpha = 0, lambda = 0)
+  params_initial_glmnet <- coef(initial_glmnet)
+  params_initial_glmnet <- as.numeric(params_initial_glmnet)
+  print_acc_mcc(T = data_test$logWellDepth, 
+            Y = data_test$logconcentration_plus_median, 
+            policy = k_matrix_test %*% params_initial_glmnet,
+            # policy = k_matrix_test %*% params_old, 
+            threshold_val = log(5))
+}
+
+```
+
+m equal to -0.5 seems to be better, we will further try it with a finer grid near  m=-0.5
+
+
+```{r}
+for(m in c(-0.7,-0.5,-0.3,-0.1)){
+  cat('value of m is ',m,'\n')
+  gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+  k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+  
+  k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+  k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+  initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial, alpha = 0, lambda = 0)
+  params_initial_glmnet <- coef(initial_glmnet)
+  params_initial_glmnet <- as.numeric(params_initial_glmnet)
+  print_acc_mcc(T = data_test$logWellDepth, 
+            Y = data_test$logconcentration_plus_median, 
+            policy = k_matrix_test %*% params_initial_glmnet,
+            # policy = k_matrix_test %*% params_old, 
+            threshold_val = log(5))
+}
+```
+
+It turns out -0.5 is the best
+
+
+##### Cross-Validation for surrogate kernel bandwidth in initialization
+
+```{r}
+# This function contains the work for a single iteration of your original loop
+find_best_policy <- function(i, initial_value_set, kernel_bw) {
+  
+  # Use Inf for a more robust starting loss value
+  tmp_loss <- Inf
+  tmp_direct_policy <- NA # Default return value in case of errors
+  
+  # Inner loop to find the best initial point for the optimization
+  for (initial_point in initial_value_set) {
+    
+    # Use try() to catch potential errors during optimization
+    
+      direct_trt_result <- optim(par = initial_point,
+            fn = compute_total_loss_smooth,
+            gr = d_compute_total_loss_smooth,
+            subject_idx = i,
+            # Pass other necessary arguments using ...
+            T = data_train$logWellDepth,
+            krige_adjust = krige_values_RKHS,
+            outcome_resid = resids,
+            propensity_est = 1/weights_cbps$weights,
+            smoothers = smoothers_RKHS, 
+            cumint_smoothers = cumint_smoothers_RKHS, 
+            trt_bounds = depth_range,
+            threshold_val = log(5), 
+            kernel_bw = kernel_bw, 
+            clip_epsilon = clip_epsilon ,
+            surrogate_type = "Gaussian",
+            loss_type = "db",
+            method = "L-BFGS-B",
+            # Set trace = 0 to prevent garbled console output from parallel workers
+            control = list(maxit = 300, trace = 0)) 
+    
+    
+    # Check if optim succeeded and if the new loss is an improvement
+    if (direct_trt_result$value < tmp_loss) {
+      tmp_loss <- direct_trt_result$value
+      tmp_direct_policy <- direct_trt_result$par
+    }
+  }
+  
+  return(tmp_direct_policy)
+}
+```
+
+```{r}
+kernel_bw_lst <- c(0.5 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5),  1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5), 1.5 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5), 2 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5))
+
+for(kernel_bw_try in kernel_bw_lst){
+  cat('The kernel bandwith is ',kernel_bw_try, '\n')
+  direct_individual_multi_initial <- mcmapply(FUN = find_best_policy, i = 1:nrow(data), MoreArgs = list(
+initial_value_set = initial_value_set, kernel_bw = kernel_bw_try), SIMPLIFY = TRUE)
+  mcc_metric <- yardstick::mcc_vec(truth = as.factor(log(data_train$concentration_plus_median) > threshold_val), estimate = as.factor( direct_individual_multi_initial > data_train$logWellDepth))
+  cat('mcc is ',mcc_metric,'\n')
+}
+```
+It seems that a larger bandwidth is better
+
+```{r}
+kernel_bw_lst <- c(2 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5), 2.5 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5), 3 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5), 3.5 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5))
+
+for(kernel_bw_try in kernel_bw_lst){
+  cat('The kernel bandwith is ',kernel_bw_try, '\n')
+  direct_individual_multi_initial <- mcmapply(FUN = find_best_policy, i = 1:nrow(data), MoreArgs = list(
+initial_value_set = initial_value_set, kernel_bw = kernel_bw_try), SIMPLIFY = TRUE)
+  mcc_metric <- yardstick::mcc_vec(truth = as.factor(log(data_train$concentration_plus_median) > threshold_val), estimate = as.factor( direct_individual_multi_initial > data_train$logWellDepth))
+  cat('mcc is ',mcc_metric,'\n')
+}
+```
+It seems that 2.5 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5) is the best
+
+```{r}
+kernel_bw_try <- 2.5 * 1.06 * sd(data_train$logWellDepth) *nrow(data)^(-1/5)
+direct_individual_multi_initial <- mcmapply(FUN = find_best_policy, i = 1:nrow(data), MoreArgs = list(
+initial_value_set = initial_value_set, kernel_bw = kernel_bw_try), SIMPLIFY = TRUE)
+```
+
+
+```{r}
+for(m in c(-0.7,-0.5,-0.3,-0.1)){
+  cat('value of m is ',m,'\n')
+  gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+  k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+  
+  k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+  k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+  initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial, alpha = 0, lambda = 0)
+  params_initial_glmnet <- coef(initial_glmnet)
+  params_initial_glmnet <- as.numeric(params_initial_glmnet)
+  print_acc_mcc(T = data_test$logWellDepth, 
+            Y = data_test$logconcentration_plus_median, 
+            policy = k_matrix_test %*% params_initial_glmnet,
+            # policy = k_matrix_test %*% params_old, 
+            threshold_val = log(5))
+}
+```
+
+The chosen surrogate bandwith does not increase the performance, what we do does not make sense, I think we need a valide cross-validation.
+
+##### Cross-Validation with ...
+
+
+```{r}
+initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial, alpha = 0, lambda = 0)
+params_initial_glmnet <- coef(initial_glmnet)
+params_initial_glmnet <- as.numeric(params_initial_glmnet)
+```
+
+```{r}
+print_acc_mcc(T = data_test$logWellDepth, 
+            Y = data_test$logconcentration_plus_median, 
+            policy = k_matrix_test %*% params_initial_glmnet,
+            # policy = k_matrix_test %*% params_old, 
+            threshold_val = log(5))
+```
+
+
+```{r}
+for(m in c(-2,,-1.5,-1,-0.5)){
+  gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+  k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+
+  k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+  k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+  
+}
+```
+
+
+##### optimal
+
+```{r}
+m <- -0.5
+gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+rbf <- rbfdot(sigma = 1/(gamma^2))
+k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+
+k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial, alpha = 0, lambda = 0)
+params_initial_glmnet <- coef(initial_glmnet)
+params_initial_glmnet <- as.numeric(params_initial_glmnet)
+print_acc_mcc(T = data_test$logWellDepth, 
+          Y = data_test$logconcentration_plus_median, 
+          policy = k_matrix_test %*% params_initial_glmnet,
+          # policy = k_matrix_test %*% params_old, 
+          threshold_val = log(5))
+```
+
+```{r}
+hist(k_matrix_test %*% params_initial_glmnet)
+```
+
+
+```{r}
+compute_total_loss_smooth_RKHS(params =  c(0, direct_individual_multi_initial),
+                                K = cbind(rep(0, nrow(data)), diag(nrow(data))),
+                                T = data_train$logWellDepth,
+                                krige_adjust = krige_values_RKHS,
+                                outcome_resid = resids,
+                                propensity_est = 1/weights_cbps$weights,
+                                lambda = 0, 
+                                cumint_smoothers = cumint_smoothers_RKHS,
+                                smoothers = smoothers_RKHS,
+                                trt_bounds = depth_range,
+                                threshold_val = log(5), 
+                                kernel_bw= kernel_bw, 
+                                clip_epsilon = clip_epsilon * 20,
+                                surrogate_type = "Gaussian",
+                                loss_type = "db")
+```
+
+
+```{r}
+compute_total_loss_smooth_RKHS(params =  params_initial_glmnet,
+                                K = k_matrix,
+                                T = data_train$logWellDepth,
+                                krige_adjust = krige_values_RKHS,
+                                outcome_resid = resids,
+                                propensity_est = 1/weights_cbps$weights,
+                                lambda = 0, 
+                                cumint_smoothers = cumint_smoothers_RKHS,
+                                smoothers = smoothers_RKHS,
+                                trt_bounds = depth_range,
+                                threshold_val = log(5), 
+                                kernel_bw= kernel_bw, 
+                                clip_epsilon = clip_epsilon * 20,
+                                surrogate_type = "Gaussian",
+                                loss_type = "db")
+```
+
+```{r}
+compute_total_loss_smooth_dc_approx_RKHS(params =  params_initial_glmnet,
+                                         params_old = params_initial_glmnet,
+                                K = k_matrix,
+                                T = data_train$logWellDepth,
+                                krige_adjust = krige_values_RKHS,
+                                outcome_resid = resids,
+                                propensity_est = 1/weights_cbps$weights,
+                                lambda = 0, 
+                                cumint_smoothers = cumint_smoothers_RKHS,
+                                smoothers = smoothers_RKHS,
+                                trt_bounds = depth_range,
+                                threshold_val = log(5), 
+                                kernel_bw= kernel_bw, 
+                                clip_epsilon = clip_epsilon * 20,
+                                clip_epsilon_bar = 20 * clip_epsilon,
+                                surrogate_type = "Gaussian",
+                                loss_type = "db")
+```
+
+
+```{r}
+max_iter <- 50
+tol <- 1e-3
+
+params_old <- params_initial_glmnet
+for(k in 1:max_iter) {
+  sub_result <- optim(par = params_old, 
+                      fn = compute_total_loss_smooth_dc_approx_RKHS, # for multiple of it, we have to use sum
+                      gr = d_compute_total_loss_smooth_dc_approx_RKHS, # we try the case with/without gr, we found
+                      params_old = params_old, 
+                      K = k_matrix,
+                      T = data_train$logWellDepth,
+                      krige_adjust = krige_values_RKHS,
+                      outcome_resid = resids,
+                      propensity_est = 1/weights_cbps$weights,
+                      lambda = 2, 
+                      cumint_smoothers = cumint_smoothers_RKHS, 
+                      smoothers = smoothers_RKHS,
+                      trt_bounds = depth_range,
+                      threshold_val = log(5), 
+                      kernel_bw= kernel_bw, 
+                      # clip_epsilon = 1,
+                      # clip_epsilon_bar = 1000,
+                      clip_epsilon = clip_epsilon * 20,
+                      clip_epsilon_bar = 20 * clip_epsilon,
+                      surrogate_type = "Gaussian",
+                      loss_type = "db",
+                      method = "L-BFGS-B" , 
+                      control = list(maxit = 50, trace = 1))
+  
+  params <- sub_result$par
+  
+  
+  # 3. Check for convergence
+  change <- sqrt(sum((params_old - params)^2))
+  cat(sprintf("Iter: %d, Change: %f, Objective: %f\n", k, change, sub_result$value))
+  
+  if (change < tol) {
+    cat("--- DC Algorithm Converged ---\n")
+    params_old <- params
+    break
+  }
+  params_old <- params
+  
+  print_acc_mcc(T = data_test$logWellDepth, 
+          Y = data_test$logconcentration_plus_median, 
+          # policy = k_matrix_test %*% params_initial_glmnet,
+          policy = k_matrix_test %*% params_old,
+          threshold_val = log(5))
+}
+```
+
+
+I think we need to do official cross-validation of the parameter
+
+
+

@@ -1,0 +1,2511 @@
+---
+title: "manuscript_figure"
+author: "Xindi Lin"
+date: "2025-10-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(ranger)
+library(SuperLearner)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(WeightIt)
+library(GpGp)
+library(Metrics)
+library(rnaturalearth)
+library(ggplot2)
+library(see)
+library(yardstick)
+library(xgboost)
+library(glmnet)
+library(kernlab)
+library(glmnet)
+library(numDeriv)
+library(MASS)
+library(tigris)
+library(rnaturalearthdata)
+library(e1071)
+library(broom)
+library(stringr) # For str_remove_all
+library(gratia) # gam plot smooth term
+library(ggeffects)
+```
+
+```{r}
+source('data_generation.R')
+source('funcs_kriging.R')
+source('loss_functions.R')
+source('loss_functions_RKHS.R')
+source('miscellaneous.R')
+```
+
+
+
+#### calculate rate of passing threshold at every county
+
+```{r}
+data <- load_nitrate_data(zero_inflated = TRUE)
+```
+
+#### censor 5 years and average
+
+```{r}
+data <- load_nitrate_data(zero_inflated = FALSE)
+```
+
+get data in the past five years. If a well is measured multiple times, use average/median of the measurement
+
+```{r}
+dim(data)
+```
+
+```{r}
+sum(data$SampleYear>=2020)
+data <- data[data$SampleYear>=2020, ]
+```
+
+```{r}
+data <- data %>%
+  group_by(WellDepth, latitude, longitude) %>%
+  mutate(
+    concentration_plus_mean_five_years = mean(concentration_plus_median, na.rm = TRUE),
+    concentration_plus_median_five_years = median(concentration_plus_median, na.rm = TRUE),
+  ) %>%
+  ungroup()
+```
+
+```{r}
+data <- data %>%
+  group_by(WellDepth, latitude, longitude) %>%
+  # Keep the row with the latest date within each group
+  slice_max(order_by = SampleYear, n = 1) %>%
+  ungroup()
+```
+
+
+##### get latest data and exceedance rate
+
+If we do this, it should not be zero-inflated
+
+To do this, we should keep most recent measurement of each well
+
+We will first separate the historical data and most recent data
+
+```{r}
+data_latest <- get_latest_record(data)
+```
+
+```{r}
+data_latest_historical <- get_latest_and_hitorical_nitrate_record(data)
+data_historical <- data_latest_historical$historical_nitrate_record
+```
+
+```{r}
+exceedance_rate_10 <- data_latest %>% 
+  group_by(County) %>% 
+  summarise(
+    exceedance_rate_10 = mean(concentration_plus_median>=10),
+    .groups = 'drop'  # This is good practice to ungroup the result
+  )
+```
+
+```{r}
+exceedance_rate_5 <- data_latest %>% 
+  group_by(County) %>% 
+  summarise(
+    exceedance_rate_5 = mean(concentration_plus_median>=5),
+    .groups = 'drop'  # This is good practice to ungroup the result
+  )
+```
+
+##### visualization
+
+```{r}
+# this requires rnaturalearthdata
+counties <- counties(state = "WI", cb = TRUE, year = 2022) # 'cb = TRUE' for cartographic boundary (simplified) version
+counties = counties[,c("NAME","geometry")]
+colnames(counties) = c("County","geometry")
+```
+
+```{r}
+counties = left_join(counties,exceedance_rate_10,by="County")
+counties = left_join(counties,exceedance_rate_5,by="County")
+```
+
+
+```{r}
+ggplot()+
+  geom_sf(data = counties,aes(fill=exceedance_rate_10))+
+  scale_fill_distiller(palette = "Blues",
+                        name = 'Exceedance Rate',
+                        direction = 1, 
+                        labels = scales::percent)+
+  labs(title = "Exceedance Rate 10mg/L", x = "Longitude", y = "Latitude") +
+  theme_void()
+
+ggplot()+
+  geom_sf(data = counties,aes(fill=exceedance_rate_5))+
+  scale_color_viridis_c(option = "plasma")+
+  scale_fill_distiller(palette = "Blues",
+                        name = 'Exceedance Rate',
+                        direction = 1, 
+                        labels = scales::percent)+
+  labs(title = "Exceedance Rate 5mg/L", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+
+Central, South Central, West Central are the most severe
+
+
+#### generate required well depth for the whole state
+
+```{r}
+# rename it for the use of the function that has been defined
+data$concentration_plus_median <- data$concentration_plus_median_five_years
+```
+
+```{r}
+data_split <- split_nitrate_data(data)
+```
+
+###### outcome regression
+
+```{r}
+outcome_regression <- outcome_regression_SVM(data = data_split$data, data_test = data_split$data_test,tunning = FALSE)
+```
+
+```{r}
+cat('Training: ')
+Metrics::rmse(data_split$data$logconcentration_plus_median, outcome_regression$pred + outcome_regression$krige_values)
+Metrics::rmse(data_split$data$logconcentration_plus_median, outcome_regression$pred)
+cat('\n')
+cat('Test: ')
+Metrics::rmse(data_split$data_test$logconcentration_plus_median, outcome_regression$pred_test + outcome_regression$krige_values_test)
+Metrics::rmse(data_split$data_test$logconcentration_plus_median, outcome_regression$pred_test)
+```
+
+Training: [1] 0.782782
+[1] 0.8808793
+
+Test: [1] 0.8007543
+[1] 0.9051775
+
+This is way too large. It is better to separate them (This is my initial thoughts). But the reason is not we estimate it as a whole. It is because we only keep 
+
+```{r}
+plot(data_split$data_test$logconcentration_plus_median, outcome_regression$pred_test)
+abline(0,1,col='red')
+```
+
+I think this looks way too bad.
+
+```{r}
+depth_range <- c(min(data_split$data$logWellDepth), max(data_split$data$logWellDepth))
+
+smoothers <- get_smoothers_RKHS(design_matrix = outcome_regression$design_matrix,
+                                              design_matrix_test = outcome_regression$design_matrix_test,
+                                              svm_auto = outcome_regression$svm,
+                                              depth_range = depth_range)
+```
+
+```{r}
+saveRDS(smoothers, "smoothers_all_five_years_median.rds")
+```
+
+###### indirect method
+
+```{r}
+threshold_val = log(5)
+
+indirect_policy_RKHS_south_west <- compute_indirect_policy(smoothers = smoothers_south_west$smoothers_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = outcome_regression_south_west$krige_values, spatial = TRUE)
+
+indirect_policy_test_RKHS_south_west <- compute_indirect_policy(smoothers = smoothers_south_west$smoothers_test_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = outcome_regression_south_west$krige_values_test, spatial = TRUE)
+```
+
+```{r}
+cat('Indirect Training data:\n')
+print_acc_mcc(T = data_south_west_split$data$logWellDepth, 
+              Y = data_south_west_split$data$logconcentration_plus_median,
+              policy = indirect_policy_RKHS_south_west,
+              threshold_val = log(5))
+
+cat('Indirect Test data:\n')
+print_acc_mcc(T = data_south_west_split$data_test$logWellDepth, 
+              Y = data_south_west_split$data_test$logconcentration_plus_median,
+              policy = indirect_policy_test_RKHS_south_west,
+              threshold_val = log(5))
+```
+
+###### propensity
+
+####### covariate balance
+
+```{r}
+weights_cbps_south_west <- weightit(logWellDepth ~ StaticLevel+crop_type_combine+drainagecl+precipitation+cafolog, 
+                                       data = data_south_west_split$data, method = "cbps")
+
+summary(weights_cbps_south_west$weights)
+```
+
+###### initialization
+
+```{r}
+initial_value_set <- c(depth_range_south_west[1] - 1, mean(depth_range_south_west), depth_range_south_west[2] + 1)
+kernel_bw_south_west <- 1.06 * sd(data_south_west_split$data$logWellDepth) *nrow(data_south_west_split$data)^(-1/5)
+
+
+direct_individual_multi_initial_south_west <- mcmapply(FUN = find_best_policy, 
+                                                          i = 1:nrow(data_south_west_split$data), 
+                                                          MoreArgs = list(initial_value_set = initial_value_set, 
+                                                                          kernel_bw = kernel_bw_south_west,
+                                                                          outcome_regression_object = outcome_regression_south_west, 
+                                                                          data = data_south_west_split$data, 
+                                                                          weights = weights_cbps_south_west$weights,
+                                                                          smoothers = smoothers_south_west, 
+                                                                          depth_range = depth_range_south, 
+                                                                          threshold_val = log(5), 
+                                                                          clip_epsilon = 20), SIMPLIFY = TRUE)
+saveRDS(direct_individual_multi_initial_south_west, "direct_individual_multi_initial_south_west.rds")
+
+
+print_acc_mcc(T = data_south_west_split$data$logWellDepth, 
+              Y = data_south_west_split$data$logconcentration_plus_median,
+              policy = direct_individual_multi_initial_south_west,
+              threshold_val = log(5))
+```
+
+```{r}
+saveRDS(direct_individual_multi_initial_south_west, "direct_individual_multi_initial_south_west.rds")
+```
+
+```{r}
+print_acc_mcc(T = data_south_west_split$data$logWellDepth, 
+              Y = data_south_west_split$data$logconcentration_plus_median,
+              policy = direct_individual_multi_initial_south_west,
+              threshold_val = log(5))
+
+```
+              
+              
+#### generate well depth at different area
+
+```{r}
+data <- load_nitrate_data(zero_inflated = FALSE)
+```
+
+```{r}
+table(data$area)
+```
+
+```{r}
+data <- data[data$SampleYear>=2019,]
+```
+
+```{r}
+table(data$area)
+```
+
+```{r}
+data_central <- data[data$area=="Central",]
+data_south_central <- data[data$area=="South Central",]
+data_west_central <- data[data$area=="West Central",]
+data_east_central <- data[data$area=="East Central",]
+data_south_west <- data[data$area=="South West",]
+data_low_risk <- data[data$area %in% c("South West","East Central","West Central","Central","South Central"),]
+```
+
+```{r}
+dim(data_low_risk)
+```
+
+
+##### generate well depth at center
+
+###### outcome regression
+
+```{r}
+data_central_split <- split_nitrate_data(data_central)
+```
+
+```{r}
+outcome_regression_central <- outcome_regression_SVM(data = data_central_split$data, data_test = data_central_split$data_test,tunning = FALSE)
+# outcome_regression_central <- outcome_regression_SVM(data = data_central_split$data, data_test = data_central_split$data_test,tunning = TRUE)
+```
+
+I found that when we tune the SVM, the performance at test dataset become worse.
+With tunning: the result is Training: [1] 0.5618343, [1] 0.5756266. Test: [1] 0.792658, [1] 0.8238066
+Without tunning: the result is Training: [1] 0.7460349 [1] 0.816856. Test: [1] 0.7658335, [1] 0.8454641
+
+```{r}
+cat('Training: ')
+Metrics::rmse(data_central_split$data$logconcentration_plus_median, outcome_regression_central$pred + outcome_regression_central$krige_values)
+Metrics::rmse(data_central_split$data$logconcentration_plus_median, outcome_regression_central$pred)
+cat('\n')
+cat('Test: ')
+Metrics::rmse(data_central_split$data_test$logconcentration_plus_median, outcome_regression_central$pred_test + outcome_regression_central$krige_values_test)
+Metrics::rmse(data_central_split$data_test$logconcentration_plus_median, outcome_regression_central$pred_test)
+```
+
+###### smoothers
+
+```{r}
+depth_range_center <- c(min(data_central_split$data$logWellDepth), max(data_central_split$data$logWellDepth))
+```
+
+```{r}
+smoothers_central <- get_smoothers_RKHS(design_matrix = outcome_regression_central$design_matrix,
+                   design_matrix_test = outcome_regression_central$design_matrix_test,
+                   svm_auto = outcome_regression_central$svm,
+                   depth_range = depth_range)
+```
+
+The above code is very slow, so we save the result
+
+```{r}
+saveRDS(smoothers_central, "smoothers_central.rds")
+```
+
+###### indirect method
+
+```{r}
+threshold_val = log(5)
+```
+
+```{r}
+indirect_policy_RKHS_central <- compute_indirect_policy(smoothers = smoothers_central$smoothers_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = outcome_regression_central$krige_values, spatial = TRUE)
+
+indirect_policy_test_RKHS_central <- compute_indirect_policy(smoothers = smoothers_central$smoothers_test_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = outcome_regression_central$krige_values_test, spatial = TRUE)
+```
+
+```{r}
+cat('Indirect Training data:\n')
+print_acc_mcc(T = data_central_split$data$logWellDepth, 
+              Y = data_central_split$data$logconcentration_plus_median,
+              policy = indirect_policy_RKHS_central,
+              threshold_val = log(5))
+```
+
+```{r}
+cat('Indirect Test data:\n')
+print_acc_mcc(T = data_central_split$data_test$logWellDepth, 
+              Y = data_central_split$data_test$logconcentration_plus_median,
+              policy = indirect_policy_test_RKHS_central,
+              threshold_val = log(5))
+```
+
+
+###### propensity
+
+####### covariate balance
+
+It worked after I delete the well use, I think it might because the well use is not a balance covariate?
+
+```{r}
+weights_cbps_central <- weightit(logWellDepth ~ StaticLevel+crop_type_combine+drainagecl+precipitation+cafolog, 
+                         data = data_central_split$data, method = "cbps")
+```
+
+
+```{r}
+summary(weights_cbps_central$weights)
+```
+
+####### conditional density
+
+```{r}
+generalized_propensity_central <- get_generalized_propensity(data = data_central_split$data)
+```
+```{r}
+pmax(generalized_propensity_central$gps_est, 0.0001)
+```
+
+
+###### initialization
+
+```{r}
+depth_range_center <- c(min(data_central_split$data$logWellDepth), max(data_central_split$data$logWellDepth))
+initial_value_set_central <- c(depth_range_center[1] - 1, mean(depth_range_center), depth_range_center[2] + 1)
+kernel_bw_central <- 1.06 * sd(data_central_split$data$logWellDepth) *nrow(data_central_split$data)^(-1/5)
+```
+
+```{r}
+find_best_policy(i = 1, 
+                 initial_value_set = initial_value_set_central, 
+                 kernel_bw = kernel_bw_central,
+                 outcome_regression_object = outcome_regression_central, 
+                 data = data_central_split$data, 
+                 # weights_cbps = weights_cbps_central, 
+                 weights = 1/pmax(generalized_propensity_central$gps_est, 0.0001), 
+                 smoothers = smoothers_central, 
+                 depth_range = depth_range_center, 
+                 threshold_val = log(5), 
+                 clip_epsilon = 20)
+```
+
+
+```{r}
+direct_individual_multi_initial_central <- mcmapply(FUN = find_best_policy, 
+                                            i = 1:nrow(data_central_split$data), 
+                                            MoreArgs = list(initial_value_set = initial_value_set_central, 
+                                                             kernel_bw = kernel_bw_central,
+                                                             outcome_regression_object = outcome_regression_central, 
+                                                             data = data_central_split$data, 
+                                                             # weights = 1/pmax(generalized_propensity_central$gps_est, 0.0001),
+                                                             weights = weights_cbps_central$weights,
+                                                             smoothers = smoothers_central, 
+                                                             depth_range = depth_range_center, 
+                                                             threshold_val = log(5), 
+                                                             clip_epsilon = 20), SIMPLIFY = TRUE)
+```
+
+This also takes a very long time
+
+```{r}
+saveRDS(direct_individual_multi_initial_central, "direct_individual_multi_initial_central.rds")
+```
+
+
+```{r}
+print_acc_mcc(T = data_central_split$data$logWellDepth, 
+              Y = data_central_split$data$logconcentration_plus_median,
+              policy = direct_individual_multi_initial_central,
+              threshold_val = log(5))
+```
+
+This is usually high, but it is commonly overfitted.
+
+###### select kernel bandwidth
+
+```{r}
+# there is no well use, and staticlevel 
+RKHS_covariate_names = c("StaticLevel", "crop_type_combine","drainagecl","precipitation","cafolog")
+rec <- recipe(~ ., data = data_central_split$data[, RKHS_covariate_names]) %>%
+    step_dummy(all_nominal_predictors()) %>%
+    prep() # This "fits" the preprocessor
+
+```
+
+```{r}
+kernel_design_matrix <- bake(rec, new_data = data_central_split$data[, RKHS_covariate_names])
+kernel_design_matrix <- cbind(kernel_design_matrix, U = outcome_regression_central$krige_values)
+
+kernel_design_matrix_test <- bake(rec, new_data = data_central_split$data_test[, RKHS_covariate_names])
+kernel_design_matrix_test <- cbind(kernel_design_matrix_test, U = outcome_regression_central$krige_values_test)
+
+train_means <- colMeans(kernel_design_matrix)
+train_sds <- apply(kernel_design_matrix, 2, sd)
+
+kernel_design_matrix <- scale(kernel_design_matrix)
+kernel_design_matrix_test <- scale(kernel_design_matrix_test, center = train_means, scale = train_sds)
+```
+
+```{r}
+for(m in c(-4,-3,-2.5)){
+  cat("m is: ",m,'\n')
+  gamma <- 2^(m) * median(rdist(kernel_design_matrix_central))
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+  k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+  
+  k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+  k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+
+  initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial_central, alpha = 0, lambda = 0)
+  params_initial_glmnet <- coef(initial_glmnet)
+  params_initial_glmnet <- as.numeric(params_initial_glmnet)
+  cat('training: ')
+  print_acc_mcc(T = data_central_split$data$logWellDepth, 
+                Y = data_central_split$data$logconcentration_plus_median, 
+                policy = k_matrix %*% params_initial_glmnet, 
+                threshold_val = log(5))
+  
+  cat('test: ')
+  print_acc_mcc(T = data_central_split$data_test$logWellDepth, 
+                Y = data_central_split$data_test$logconcentration_plus_median, 
+                policy = k_matrix_test %*% params_initial_glmnet, 
+                threshold_val = log(5))
+  
+}
+
+```
+m is:  -4 
+training: The accuracy is  0.8967643 
+The mcc is  0.7484882 
+test: The accuracy is  0.7783619 
+The mcc is  0.4261796 
+m is:  -3 
+training: The accuracy is  0.8639327 
+The mcc is  0.6647144 
+test: The accuracy is  0.7825125 
+The mcc is  0.4455178 
+m is:  -2.5 
+training: The accuracy is  0.8435463 
+The mcc is  0.6119922 
+test: The accuracy is  0.7885999 
+The mcc is  0.4633573 
+m is:  -2 
+training: The accuracy is  0.8299158 
+The mcc is  0.5757814 
+test: The accuracy is  0.7844494 
+The mcc is  0.4543024 
+m is:  -1.5 
+training: The accuracy is  0.8122555 
+The mcc is  0.5289164 
+test: The accuracy is  0.7822357 
+The mcc is  0.4490317 
+m is:  -1 
+training: The accuracy is  0.7998104 
+The mcc is  0.4965716 
+test: The accuracy is  0.781959 
+The mcc is  0.4469434 
+ 
+Using U is much better than using coordinate.
+The static water level is a very important covariate
+
+We would choose m to be -2.5
+
+###### non-DC algorithm
+
+```{r}
+# cat("lambda is: ",lambda,'\n')
+m <- -2.5
+lambda <- 0.25
+clip_epsilon <- 30
+gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+rbf <- rbfdot(sigma = 1/(gamma^2))
+k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+
+k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+
+initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial_central, alpha = 0, lambda = 0)
+params_initial_glmnet <- coef(initial_glmnet)
+params_initial_glmnet <- as.numeric(params_initial_glmnet)
+
+kernel_optim_trt_DB_central <- optim(par = params_initial_glmnet, 
+    fn = compute_total_loss_smooth_RKHS,
+    gr = d_compute_total_loss_smooth_RKHS,
+    K = k_matrix,
+    # K = cbind(rep(1,nrow(data_central_split$data)), diag(nrow(data_central_split$data))),
+    # K = diag(nrow(data)),
+    T = data_central_split$data$logWellDepth,
+    krige_adjust = outcome_regression_central$krige_values,
+    outcome_resid = data_central_split$data$logconcentration_plus_median - outcome_regression_central$pred - outcome_regression_central$krige_values,
+    # propensity_est = pmax(generalized_propensity_central$gps_est, 0.0001),
+    propensity_est = 1/weights_cbps_central$weights,
+    lambda = lambda, 
+    smoothers = smoothers_central$smoothers_RKHS,
+    cumint_smoothers = smoothers_central$cumint_smoothers_RKHS,
+    trt_bounds = depth_range_center,
+    threshold_val = log(5), 
+    kernel_bw = kernel_bw_central, 
+    clip_epsilon = clip_epsilon,
+    surrogate_type = "Gaussian",
+    loss_type = "db",
+    method = "L-BFGS-B",
+    control = list(maxit = 1000, trace = 3)) 
+```
+
+
+```{r}
+cat('Training: \n')
+print_acc_mcc(T = data_central_split$data$logWellDepth, 
+              Y = data_central_split$data$logconcentration_plus_median,
+              policy = k_matrix %*% kernel_optim_trt_DB_central$par,
+              threshold_val = log(5))
+cat('Test: \n')
+print_acc_mcc(T = data_central_split$data_test$logWellDepth, 
+            Y = data_central_split$data_test$logconcentration_plus_median, 
+            policy = k_matrix_test %*% kernel_optim_trt_DB_central$par, 
+            threshold_val = log(5))
+```
+
+
+###### visualize depth map
+
+we need to get the plss covariate
+
+```{r}
+file_path <- "/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/plss_covariates.csv"
+command <- paste("brctl download", shQuote(file_path))
+system(command)
+plss_covariates <- read.csv(file_path)
+```
+
+```{r}
+plss_covariates_central <- plss_covariates[plss_covariates$County %in% c("Wood", "Portage", "Waupaca", "Juneau", 
+                                        "Adams", "Waushara", "Marquette", "Green Lake"),]
+```
+
+```{r}
+plss_covariates_central$cafolog <- log(plss_covariates_central$cafo + 1)
+```
+
+```{r}
+dim(plss_covariates_central)
+dim(na.omit(plss_covariates_central))
+```
+
+```{r}
+plss_covariates_central <- na.omit(plss_covariates_central)
+```
+
+There are one plss section with 'Other Crop', and one with 'Vegtables' as their crop_type_combine, which is present in training data, we will just remove them
+
+```{r}
+plss_covariates_central <- plss_covariates_central[!plss_covariates_central$crop_type_combine %in% c("Other Crop"),]
+```
+
+
+####### Interpolate static water level
+
+```{r}
+gpfit_staticLevel_central <- GpGp::fit_model(data_central$StaticLevel,
+                               locs = data_central[,c("longitude", "latitude")],
+                               covfun_name = "matern_sphere")
+
+plss_covariates_central$StaticLevel <-  GpGp::predictions(fit = gpfit_staticLevel_central,
+                  locs_pred = plss_covariates_central[,c("longitude", "latitude")], 
+                  X_pred = rep(1,nrow(plss_covariates_central)))
+```
+
+####### get kriging values for plss
+
+```{r}
+plss_krige_values_central <- GpGp::predictions(fit = outcome_regression_central$gpfit, locs_pred = plss_covariates_central[,c("longitude", "latitude")], X_pred = rep(1,nrow(plss_covariates_central)))
+```
+
+####### build kernel matrices
+
+```{r}
+RKHS_covariate_names = c("StaticLevel", "crop_type_combine","drainagecl","precipitation","cafolog")
+rec <- recipe(~ ., data = data_central_split$data[, RKHS_covariate_names]) %>%
+    step_dummy(all_nominal_predictors()) %>%
+    prep() # This "fits" the preprocessor
+```
+
+```{r}
+plss_kernel_design_matrix_central <- bake(rec, new_data = plss_covariates_central[,  RKHS_covariate_names])
+
+plss_kernel_design_matrix_central <- cbind(plss_kernel_design_matrix_central, U = plss_krige_values_central)
+plss_kernel_design_matrix_central <- scale(plss_kernel_design_matrix_central, center = train_means, scale = train_sds)
+```
+
+```{r}
+plss_k_matrix_central <- kernelMatrix(rbf, plss_kernel_design_matrix_central, kernel_design_matrix)
+plss_k_matrix_central <- cbind(rep(1,nrow(plss_k_matrix_central)), plss_k_matrix_central)
+```
+
+####### generate map
+
+```{r}
+plss_covariates_central$policy <- plss_k_matrix_central %*% kernel_optim_trt_DB_central$par
+```
+
+```{r}
+plss_covariates_central_sf <- st_as_sf(plss_covariates_central, coords = c('longitude','latitude'), crs=4326)
+```
+
+```{r}
+ggplot()+
+  geom_sf(data = plss_covariates_west_central_sf, aes(color = policy), size = 0.1) +
+  geom_sf(data = plss_covariates_east_central_sf, aes(color = policy), size = 0.1) +
+  geom_sf(data = plss_covariates_central_sf, aes(color = policy), size = 0.1) +
+  geom_sf(data = counties,color = 'black')+
+  scale_color_viridis_c(option = "plasma",
+                        name = "Minimum Depth (Feet)",
+                        labels = function(breaks) { round(exp(breaks), 0) })+
+  labs(title = "5mg/L Threshold Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+```{r}
+plss_covariates_central_sf$U = plss_krige_values_central
+```
+
+
+```{r}
+ggplot()+
+  geom_sf(data = plss_covariates_central_sf, aes(color = U), size = 0.15) +
+  geom_sf(data = counties,color = 'black')+
+  scale_color_viridis_c(option = "plasma",
+                        name = "Estimation of U",
+                        labels = function(breaks) { round(exp(breaks), 0) })+
+  labs(title = "5mg/L Threshold Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+
+##### generate well depth at west center
+
+###### outcome regression
+
+```{r}
+data_west_central_split <- split_nitrate_data(data_west_central)
+```
+
+```{r}
+outcome_regression_west_central <- outcome_regression_SVM(data = data_west_central_split$data, data_test = data_west_central_split$data_test,tunning = FALSE)
+```
+
+```{r}
+cat('Training: ')
+Metrics::rmse(data_west_central_split$data$logconcentration_plus_median, outcome_regression_west_central$pred + outcome_regression_west_central$krige_values)
+Metrics::rmse(data_west_central_split$data$logconcentration_plus_median, outcome_regression_west_central$pred)
+cat('\n')
+cat('Test: ')
+Metrics::rmse(data_west_central_split$data_test$logconcentration_plus_median, outcome_regression_west_central$pred_test + outcome_regression_west_central$krige_values_test)
+Metrics::rmse(data_west_central_split$data_test$logconcentration_plus_median, outcome_regression_west_central$pred_test)
+```
+
+###### smoothers
+
+```{r}
+depth_range <- c(min(data_west_central_split$data$logWellDepth), max(data_west_central_split$data$logWellDepth))
+```
+
+```{r}
+smoothers_west_central <- get_smoothers_RKHS(design_matrix = outcome_regression_west_central$design_matrix,
+                   design_matrix_test = outcome_regression_west_central$design_matrix_test,
+                   svm_auto = outcome_regression_west_central$svm,
+                   depth_range = depth_range)
+```
+
+The above code is very slow, so we save the result
+
+```{r}
+saveRDS(smoothers_west_central, "smoothers_west_central.rds")
+```
+
+###### indirect method
+
+```{r}
+threshold_val = log(5)
+```
+
+```{r}
+indirect_policy_RKHS_west_central <- compute_indirect_policy(smoothers = smoothers_west_central$smoothers_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = outcome_regression_west_central$krige_values, spatial = TRUE)
+
+indirect_policy_test_RKHS_west_central <- compute_indirect_policy(smoothers = smoothers_west_central$smoothers_test_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = outcome_regression_west_central$krige_values_test, spatial = TRUE)
+```
+
+```{r}
+cat('Indirect Training data:\n')
+print_acc_mcc(T = data_west_central_split$data$logWellDepth, 
+              Y = data_west_central_split$data$logconcentration_plus_median,
+              policy = indirect_policy_RKHS_west_central,
+              threshold_val = log(5))
+```
+
+```{r}
+cat('Indirect Test data:\n')
+print_acc_mcc(T = data_west_central_split$data_test$logWellDepth, 
+              Y = data_west_central_split$data_test$logconcentration_plus_median,
+              policy = indirect_policy_test_RKHS_west_central,
+              threshold_val = log(5))
+```
+
+
+###### propensity
+
+####### covariate balance
+
+It worked after I delete the well use, I think it might because the well use is not a balance covariate?
+
+```{r}
+weights_cbps_west_central <- weightit(logWellDepth ~ StaticLevel+crop_type_combine+drainagecl+precipitation+cafolog, 
+                         data = data_west_central_split$data, method = "cbps")
+```
+
+
+```{r}
+summary(weights_cbps_west_central$weights)
+```
+
+####### conditional density
+
+```{r}
+generalized_propensity_west_central <- get_generalized_propensity(data = data_west_central_split$data)
+```
+```{r}
+pmax(generalized_propensity_west_central$gps_est, 0.0001)
+```
+
+
+###### initialization
+
+```{r}
+initial_value_set <- c(depth_range[1] - 1, mean(depth_range), depth_range[2] + 1)
+kernel_bw_west_central <- 1.06 * sd(data_west_central_split$data$logWellDepth) *nrow(data_west_central_split$data)^(-1/5)
+depth_range <- c(min(data_west_central_split$data$logWellDepth), max(data_west_central_split$data$logWellDepth))
+```
+
+```{r}
+find_best_policy(i = 1, 
+                 initial_value_set = initial_value_set, 
+                 kernel_bw = kernel_bw_west_central,
+                 outcome_regression_object = outcome_regression_west_central, 
+                 data = data_west_central_split$data, 
+                 # weights_cbps = weights_cbps_west_central, 
+                 weights = 1/pmax(generalized_propensity_west_central$gps_est, 0.0001), 
+                 smoothers = smoothers_west_central, 
+                 depth_range = depth_range, 
+                 threshold_val = log(5), 
+                 clip_epsilon = 20)
+```
+
+
+```{r}
+direct_individual_multi_initial_west_central <- mcmapply(FUN = find_best_policy, 
+                                            i = 1:nrow(data_west_central_split$data), 
+                                            MoreArgs = list(initial_value_set = initial_value_set, 
+                                                             kernel_bw = kernel_bw_west_central,
+                                                             outcome_regression_object = outcome_regression_west_central, 
+                                                             data = data_west_central_split$data, 
+                                                             # weights = 1/pmax(generalized_propensity_west_central$gps_est, 0.0001),
+                                                             weights = weights_cbps_west_central$weights,
+                                                             smoothers = smoothers_west_central, 
+                                                             depth_range = depth_range, 
+                                                             threshold_val = log(5), 
+                                                             clip_epsilon = 20), SIMPLIFY = TRUE)
+```
+
+```{r}
+print_acc_mcc(T = data_west_central_split$data$logWellDepth, 
+              Y = data_west_central_split$data$logconcentration_plus_median,
+              policy = direct_individual_multi_initial_west_central,
+              threshold_val = log(5))
+```
+
+
+###### select kernel bandwidth
+
+
+```{r}
+# there is no well use, and staticlevel 
+RKHS_covariate_names = c("StaticLevel", "crop_type_combine","drainagecl","precipitation","cafolog")
+rec <- recipe(~ ., data = data_west_central_split$data[, RKHS_covariate_names]) %>%
+    step_dummy(all_nominal_predictors()) %>%
+    prep() # This "fits" the preprocessor
+
+```
+
+```{r}
+# kernel_design_matrix <- outcome_regression_west_central$design_matrix
+# kernel_design_matrix$logWellDepth <- NULL
+# kernel_design_matrix <- cbind(kernel_design_matrix, U = outcome_regression_west_central$krige_values)
+# 
+# kernel_design_matrix_test <- outcome_regression_west_central$design_matrix_test
+# kernel_design_matrix_test$logWellDepth <- NULL
+# kernel_design_matrix_test <- cbind(kernel_design_matrix_test, U = outcome_regression_west_central$krige_values_test)
+```
+
+```{r}
+kernel_design_matrix <- bake(rec, new_data = data_west_central_split$data[, RKHS_covariate_names])
+kernel_design_matrix <- cbind(kernel_design_matrix, U = outcome_regression_west_central$krige_values)
+
+kernel_design_matrix_test <- bake(rec, new_data = data_west_central_split$data_test[, RKHS_covariate_names])
+kernel_design_matrix_test <- cbind(kernel_design_matrix_test, U = outcome_regression_west_central$krige_values_test)
+
+train_means <- colMeans(kernel_design_matrix)
+train_sds <- apply(kernel_design_matrix, 2, sd)
+
+kernel_design_matrix <- scale(kernel_design_matrix)
+kernel_design_matrix_test <- scale(kernel_design_matrix_test, center = train_means, scale = train_sds)
+```
+
+```{r}
+for(m in c(-3,-2,-1.5,-1)){
+  cat("m is: ",m,'\n')
+  gamma <- 2^(m) * median(rdist(kernel_design_matrix))
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+  k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+  
+  k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+  k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+
+  initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial_west_central, alpha = 0, lambda = 0)
+  params_initial_glmnet <- coef(initial_glmnet)
+  params_initial_glmnet <- as.numeric(params_initial_glmnet)
+  cat('training: ')
+  print_acc_mcc(T = data_west_central_split$data$logWellDepth, 
+                Y = data_west_central_split$data$logconcentration_plus_median, 
+                policy = k_matrix %*% params_initial_glmnet, 
+                threshold_val = log(5))
+  
+  cat('test: ')
+  print_acc_mcc(T = data_west_central_split$data_test$logWellDepth, 
+                Y = data_west_central_split$data_test$logconcentration_plus_median, 
+                policy = k_matrix_test %*% params_initial_glmnet, 
+                threshold_val = log(5))
+  
+}
+```
+ 
+Using U is much better than using coordinate.
+The static water level is a very important covariate
+
+
+###### non-DC algorithm
+
+```{r}
+kernel_design_matrix <- outcome_regression_west_central$design_matrix
+kernel_design_matrix$logWellDepth <- NULL
+kernel_design_matrix <- cbind(kernel_design_matrix, U = outcome_regression_west_central$krige_values)
+
+kernel_design_matrix_test <- outcome_regression_west_central$design_matrix_test
+kernel_design_matrix_test$logWellDepth <- NULL
+kernel_design_matrix_test <- cbind(kernel_design_matrix_test, U = outcome_regression_west_central$krige_values_test)
+
+train_means <- colMeans(kernel_design_matrix)
+train_sds <- apply(kernel_design_matrix, 2, sd)
+
+kernel_design_matrix <- scale(kernel_design_matrix)
+kernel_design_matrix_test <- scale(kernel_design_matrix_test, center = train_means, scale = train_sds)
+```
+
+```{r}
+# cat("lambda is: ",lambda,'\n')
+m <- -3
+lambda <- 0.25
+clip_epsilon <- 30
+gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+rbf <- rbfdot(sigma = 1/(gamma^2))
+k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+
+k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+
+initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial_west_central, alpha = 0, lambda = 0)
+params_initial_glmnet <- coef(initial_glmnet)
+params_initial_glmnet <- as.numeric(params_initial_glmnet)
+
+kernel_optim_trt_DB_west_central <- optim(par = params_initial_glmnet, 
+    fn = compute_total_loss_smooth_RKHS,
+    gr = d_compute_total_loss_smooth_RKHS,
+    K = k_matrix,
+    # K = cbind(rep(1,nrow(data_west_central_split$data)), diag(nrow(data_west_central_split$data))),
+    # K = diag(nrow(data)),
+    T = data_west_central_split$data$logWellDepth,
+    krige_adjust = outcome_regression_west_central$krige_values,
+    outcome_resid = data_west_central_split$data$logconcentration_plus_median - outcome_regression_west_central$pred - outcome_regression_west_central$krige_values,
+    # propensity_est = pmax(generalized_propensity_west_central$gps_est, 0.0001),
+    propensity_est = 1/weights_cbps_west_central$weights,
+    lambda = lambda, 
+    smoothers = smoothers_west_central$smoothers_RKHS,
+    cumint_smoothers = smoothers_west_central$cumint_smoothers_RKHS,
+    trt_bounds = depth_range,
+    threshold_val = log(5), 
+    kernel_bw = kernel_bw_west_central, 
+    clip_epsilon = clip_epsilon,
+    surrogate_type = "Gaussian",
+    loss_type = "db",
+    method = "L-BFGS-B",
+    control = list(maxit = 1000, trace = 3)) 
+```
+
+
+```{r}
+cat('Training: \n')
+print_acc_mcc(T = data_west_central_split$data$logWellDepth, 
+              Y = data_west_central_split$data$logconcentration_plus_median,
+              policy = k_matrix %*% kernel_optim_trt_DB_west_central$par,
+              threshold_val = log(5))
+cat('Test: \n')
+print_acc_mcc(T = data_west_central_split$data_test$logWellDepth, 
+            Y = data_west_central_split$data_test$logconcentration_plus_median, 
+            policy = k_matrix_test %*% kernel_optim_trt_DB_west_central$par, 
+            threshold_val = log(5))
+```
+
+
+###### visualize depth map
+
+we need to get the plss covariate
+
+```{r}
+file_path <- "/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/plss_covariates.csv"
+command <- paste("brctl download", shQuote(file_path))
+system(command)
+plss_covariates <- read.csv(file_path)
+```
+
+```{r}
+plss_covariates_west_central <- plss_covariates[plss_covariates$County %in% c("Pepin", "Jackson", "Buffalo", "Trempealeau", 
+                                            "La Crosse", "Monroe", "Eau Claire", "Dunn", "Pierce", "St. Croix"),]
+```
+
+```{r}
+plss_covariates_west_central$cafolog <- log(plss_covariates_west_central$cafo + 1)
+```
+
+```{r}
+dim(plss_covariates_west_central)
+dim(na.omit(plss_covariates_west_central))
+```
+
+```{r}
+plss_covariates_west_central <- na.omit(plss_covariates_west_central)
+```
+
+There are one plss section with 'Cover Crop', and one with 'Vegtables' as their crop_type_combine, which is present in training data, we will just remove them
+
+```{r}
+plss_covariates_west_central <- plss_covariates_west_central[!plss_covariates_west_central$crop_type_combine %in% c("Cover Crop", "Vegtables"),]
+```
+
+
+####### Interpolate static water level
+
+```{r}
+gpfit_staticLevel_west_central <- GpGp::fit_model(data_west_central$StaticLevel,
+                               locs = data_west_central[,c("longitude", "latitude")],
+                               covfun_name = "matern_sphere")
+
+plss_covariates_west_central$StaticLevel <-  GpGp::predictions(fit = gpfit_staticLevel_west_central,
+                  locs_pred = plss_covariates_west_central[,c("longitude", "latitude")], 
+                  X_pred = rep(1,nrow(plss_covariates_west_central)))
+```
+
+####### get kriging values for plss
+
+```{r}
+plss_krige_values_west_central <- GpGp::predictions(fit = outcome_regression_west_central$gpfit, locs_pred = plss_covariates_west_central[,c("longitude", "latitude")], X_pred = rep(1,nrow(plss_covariates_west_central)))
+```
+
+####### build kernel matrices
+
+```{r}
+RKHS_covariate_names = c("StaticLevel", "crop_type_combine","drainagecl","precipitation","cafolog")
+rec <- recipe(~ ., data = data_west_central_split$data[, RKHS_covariate_names]) %>%
+    step_dummy(all_nominal_predictors()) %>%
+    prep() # This "fits" the preprocessor
+```
+
+```{r}
+plss_kernel_design_matrix_west_central <- bake(rec, new_data = plss_covariates_west_central[,  RKHS_covariate_names])
+
+plss_kernel_design_matrix_west_central <- cbind(plss_kernel_design_matrix_west_central, U = plss_krige_values_west_central)
+plss_kernel_design_matrix_west_central <- scale(plss_kernel_design_matrix_west_central, center = train_means, scale = train_sds)
+```
+
+```{r}
+plss_k_matrix_west_central <- kernelMatrix(rbf, plss_kernel_design_matrix_west_central, kernel_design_matrix)
+plss_k_matrix_west_central <- cbind(rep(1,nrow(plss_k_matrix_west_central)), plss_k_matrix_west_central)
+```
+
+####### generate map
+
+```{r}
+plss_covariates_west_central$policy <- plss_k_matrix_west_central %*% kernel_optim_trt_DB_west_central$par
+```
+
+```{r}
+plss_covariates_west_central_sf <- st_as_sf(plss_covariates_west_central, coords = c('longitude','latitude'), crs=4326)
+```
+
+```{r}
+ggplot()+
+  geom_sf(data = plss_covariates_west_central_sf, aes(color = policy), size = 0.1) +
+  geom_sf(data = plss_covariates_east_central_sf, aes(color = policy), size = 0.1) +
+  geom_sf(data = counties,color = 'black')+
+  scale_color_viridis_c(option = "plasma",
+                        name = "Minimum Depth (Feet)",
+                        labels = function(breaks) { round(exp(breaks), 0) })+
+  labs(title = "5mg/L Threshold Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+```{r}
+plss_covariates_west_central_sf$U = plss_krige_values_west_central
+```
+
+
+```{r}
+ggplot()+
+  geom_sf(data = plss_covariates_west_central_sf, aes(color = U), size = 0.15) +
+  geom_sf(data = counties,color = 'black')+
+  scale_color_viridis_c(option = "plasma",
+                        name = "Estimation of U",
+                        labels = function(breaks) { round(exp(breaks), 0) })+
+  labs(title = "5mg/L Threshold Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+
+##### generate well depth at east central
+
+####### outcome regression
+
+```{r}
+data_east_central_split <- split_nitrate_data(data_east_central)
+```
+
+```{r}
+outcome_regression_east_central <- outcome_regression_SVM(data = data_east_central_split$data, data_test = data_east_central_split$data_test)
+```
+
+
+```{r}
+cat('Training: ')
+Metrics::rmse(data_east_central_split$data$logconcentration_plus_median, outcome_regression_east_central$pred + outcome_regression_east_central$krige_values)
+Metrics::rmse(data_east_central_split$data$logconcentration_plus_median, outcome_regression_east_central$pred)
+cat('\n')
+cat('Test: ')
+Metrics::rmse(data_east_central_split$data_test$logconcentration_plus_median, outcome_regression_east_central$pred_test + outcome_regression_east_central$krige_values_test)
+Metrics::rmse(data_east_central_split$data_test$logconcentration_plus_median, outcome_regression_east_central$pred_test)
+```
+
+###### smoothers
+
+```{r}
+depth_range <- c(min(data_east_central_split$data$logWellDepth),max(data_east_central_split$data$logWellDepth))
+```
+
+```{r}
+smoothers_east_central <- get_smoothers_RKHS(design_matrix = outcome_regression_east_central$design_matrix,
+                   design_matrix_test = outcome_regression_east_central$design_matrix_test,
+                   svm_auto = outcome_regression_east_central$svm,
+                   depth_range = depth_range)
+```
+
+
+###### indirect method
+
+```{r}
+threshold_val = log(5)
+```
+
+```{r}
+indirect_policy_RKHS <- compute_indirect_policy(smoothers = smoothers_east_central$smoothers_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = outcome_regression_east_central$krige_values, spatial = TRUE)
+
+indirect_policy_test_RKHS <- compute_indirect_policy(smoothers = smoothers_east_central$smoothers_test_RKHS, trt_bounds = depth_range, threshold_val = threshold_val, krige_adjust = outcome_regression_east_central$krige_values_test, spatial = TRUE)
+```
+
+```{r}
+cat('Indirect Training data:\n')
+print_acc_mcc(T = data_east_central_split$data$logWellDepth, 
+              Y = data_east_central_split$data$logconcentration_plus_median,
+              policy = indirect_policy_RKHS,
+              threshold_val = log(5))
+```
+
+```{r}
+cat('Indirect Test data:\n')
+print_acc_mcc(T = data_east_central_split$data_test$logWellDepth, 
+              Y = data_east_central_split$data_test$logconcentration_plus_median,
+              policy = indirect_policy_test_RKHS,
+              threshold_val = log(5))
+```
+
+###### propensity
+
+```{r}
+weights_cbps_east_central <- weightit(logWellDepth ~ StaticLevel+WellUse+crop_type_combine+drainagecl+precipitation+cafolog, 
+                         data = data_east_central_split$data, method = "cbps")
+```
+
+conditional density
+
+```{r}
+generalized_propensity_west_central <- get_generalized_propensity(data = data_west_central_split$data)
+```
+
+```{r}
+pmax(generalized_propensity_west_central$gps_est, 0.0001)
+```
+
+
+###### initialization
+
+```{r}
+mean(data_east_central_split$data$concentration_plus_median>=5)
+mean(data_east_central_split$data$concentration_plus_median>=10)
+```
+
+
+```{r}
+initial_value_set <- c(depth_range[1] - 1, mean(depth_range), depth_range[2] + 1)
+kernel_bw_east_central <- 1.06 * sd(data_east_central_split$data$logWellDepth) *nrow(data_east_central_split$data)^(-1/5)
+```
+
+```{r}
+find_best_policy(i = 1, 
+                 initial_value_set = initial_value_set, 
+                 kernel_bw = kernel_bw,
+                 outcome_regression_object = outcome_regression_east_central, 
+                 data = data_east_central_split$data, 
+                 weights = weights_cbps_east_central$weights,
+                 # weights = 1/pmax(generalized_propensity_west_central$gps_est, 0.0001), 
+                 smoothers = smoothers_east_central, 
+                 depth_range = depth_range, 
+                 threshold_val = log(5), 
+                 clip_epsilon = 20)
+```
+
+```{r}
+direct_individual_multi_initial_east_central <- mcmapply(FUN = find_best_policy, 
+                                            i = 1:nrow(data_east_central_split$data), 
+                                            MoreArgs = list(initial_value_set = initial_value_set, 
+                                                             kernel_bw = kernel_bw_east_central,
+                                                             outcome_regression_object = outcome_regression_east_central, 
+                                                             data = data_east_central_split$data, 
+                                                             weights = weights_cbps_east_central$weights,
+                                                             smoothers = smoothers_east_central, 
+                                                             depth_range = depth_range, 
+                                                             threshold_val = log(5), 
+                                                             clip_epsilon = 20), SIMPLIFY = TRUE)
+```
+
+```{r}
+print_acc_mcc(T = data_east_central_split$data$logWellDepth, 
+              Y = data_east_central_split$data$logconcentration_plus_median,
+              policy = direct_individual_multi_initial_east_central,
+              threshold_val = log(5))
+```
+
+
+###### select kernel bandwidth
+
+```{r}
+# there is no well use, and staticlevel 
+RKHS_covariate_names = c("StaticLevel", "crop_type_combine","drainagecl","precipitation","cafolog","precipitation")
+rec <- recipe(~ ., data = data_east_central_split$data[, RKHS_covariate_names]) %>%
+    step_dummy(all_nominal_predictors()) %>%
+    prep() # This "fits" the preprocessor
+
+```
+
+```{r}
+# kernel_design_matrix <- outcome_regression_west_central$design_matrix
+# kernel_design_matrix$logWellDepth <- NULL
+# kernel_design_matrix <- cbind(kernel_design_matrix, U = outcome_regression_west_central$krige_values)
+# 
+# kernel_design_matrix_test <- outcome_regression_west_central$design_matrix_test
+# kernel_design_matrix_test$logWellDepth <- NULL
+# kernel_design_matrix_test <- cbind(kernel_design_matrix_test, U = outcome_regression_west_central$krige_values_test)
+
+kernel_design_matrix <- bake(rec, new_data = data_east_central_split$data[, RKHS_covariate_names])
+
+kernel_design_matrix <- cbind(kernel_design_matrix, U = outcome_regression_east_central$krige_values)
+
+
+train_means <- colMeans(kernel_design_matrix)
+train_sds <- apply(kernel_design_matrix, 2, sd)
+
+kernel_design_matrix <- scale(kernel_design_matrix)
+
+kernel_design_matrix_test <- bake(rec, new_data = data_east_central_split$data_test[, RKHS_covariate_names])
+kernel_design_matrix_test <- cbind(kernel_design_matrix_test, U = outcome_regression_east_central$krige_values_test)
+kernel_design_matrix_test <- scale(kernel_design_matrix_test, center = train_means, scale = train_sds)
+```
+
+```{r}
+for(m in c(-3,-2,-1.5,-1)){
+  cat("m is: ",m,'\n')
+  gamma <- 2^(m) * median(rdist(kernel_design_matrix))
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+  k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+  
+  k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+  k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+
+  initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial_east_central, alpha = 0, lambda = 0)
+  params_initial_glmnet <- coef(initial_glmnet)
+  params_initial_glmnet <- as.numeric(params_initial_glmnet)
+  cat('training: ')
+  print_acc_mcc(T = data_east_central_split$data$logWellDepth, 
+                Y = data_east_central_split$data$logconcentration_plus_median, 
+                policy = k_matrix %*% params_initial_glmnet, 
+                threshold_val = log(5))
+  
+  cat('test: ')
+  print_acc_mcc(T = data_east_central_split$data_test$logWellDepth, 
+                Y = data_east_central_split$data_test$logconcentration_plus_median, 
+                policy = k_matrix_test %*% params_initial_glmnet, 
+                threshold_val = log(5))
+  
+}
+```
+ 
+Using U is much better than using coordinate. The static water level is a very important covariate
+ 
+We will use m = -4 for complete dataset.
+ 
+```{r}
+print_acc_mcc(T = data_west_central_split$data$logWellDepth, 
+              Y = data_west_central_split$data$logconcentration_plus_median, 
+              policy = direct_individual_multi_initial_west_central, 
+              threshold_val = log(5))
+```
+ 
+ 
+(we will let m be -1), this is for small, incomplete dataset. For large dataset, the required m would be very small.
+It is somehow, m should be small so that the matrix is similar to identity matrix
+
+###### non-DC algorithm
+
+```{r}
+kernel_design_matrix <- outcome_regression_west_central$design_matrix
+kernel_design_matrix$logWellDepth <- NULL
+kernel_design_matrix <- cbind(kernel_design_matrix, U = outcome_regression_west_central$krige_values)
+
+kernel_design_matrix_test <- outcome_regression_west_central$design_matrix_test
+kernel_design_matrix_test$logWellDepth <- NULL
+kernel_design_matrix_test <- cbind(kernel_design_matrix_test, U = outcome_regression_west_central$krige_values_test)
+
+train_means <- colMeans(kernel_design_matrix)
+train_sds <- apply(kernel_design_matrix, 2, sd)
+
+kernel_design_matrix <- scale(kernel_design_matrix)
+kernel_design_matrix_test <- scale(kernel_design_matrix_test, center = train_means, scale = train_sds)
+```
+
+```{r}
+# cat("lambda is: ",lambda,'\n')
+m <- -1.5
+lambda <- 0.25
+clip_epsilon <- 30
+gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
+rbf <- rbfdot(sigma = 1/(gamma^2))
+k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+
+k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+
+initial_glmnet <- glmnet(x = k_matrix[,-1], y = direct_individual_multi_initial_east_central, alpha = 0, lambda = 0)
+params_initial_glmnet <- coef(initial_glmnet)
+params_initial_glmnet <- as.numeric(params_initial_glmnet)
+
+print_acc_mcc(T = data_east_central_split$data$logWellDepth, 
+              Y = data_east_central_split$data$logconcentration_plus_median, 
+              policy = k_matrix %*% params_initial_glmnet, 
+              threshold_val = log(5))
+
+print_acc_mcc(T = data_east_central_split$data_test$logWellDepth, 
+              Y = data_east_central_split$data_test$logconcentration_plus_median, 
+              policy = k_matrix_test %*% params_initial_glmnet, 
+              threshold_val = log(5))
+```
+
+```{r}
+kernel_optim_trt_DB_east_central <- optim(par = params_initial_glmnet, 
+    fn = compute_total_loss_smooth_RKHS,
+    gr = d_compute_total_loss_smooth_RKHS,
+    K = k_matrix,
+    # K = cbind(rep(1,nrow(data_west_central_split$data)), diag(nrow(data_west_central_split$data))),
+    # K = diag(nrow(data)),
+    T = data_east_central_split$data$logWellDepth,
+    krige_adjust = outcome_regression_east_central$krige_values,
+    outcome_resid = data_east_central_split$data$logconcentration_plus_median - outcome_regression_east_central$pred - outcome_regression_east_central$krige_values,
+    propensity_est = 1/weights_cbps_east_central$weights,
+    lambda = lambda, 
+    smoothers = smoothers_east_central$smoothers_RKHS,
+    cumint_smoothers = smoothers_east_central$cumint_smoothers_RKHS,
+    trt_bounds = depth_range,
+    threshold_val = log(5), 
+    kernel_bw = kernel_bw, 
+    clip_epsilon = clip_epsilon,
+    surrogate_type = "Gaussian",
+    loss_type = "db",
+    method = "L-BFGS-B",
+    control = list(maxit = 1000, trace = 3)) 
+```
+
+```{r}
+print_acc_mcc(T = data_east_central_split$data_test$logWellDepth, 
+            Y = data_east_central_split$data_test$logconcentration_plus_median, 
+            policy = k_matrix_test %*% kernel_optim_trt_DB_east_central$par, 
+            threshold_val = log(5))
+```
+
+###### visualize depth map
+
+
+```{r}
+plss_covariates_east_central <- plss_covariates[plss_covariates$County %in% c("Outagamie", "Winnebago", "Door", "Fond du Lac", 
+                                            "Brown", "Calumet","Sheboygan","Manitowoc","Kewaunee"),]
+```
+
+```{r}
+plss_covariates_east_central$cafolog <- log(plss_covariates_east_central$cafo + 1)
+```
+
+```{r}
+plss_covariates_east_central <- na.omit(plss_covariates_east_central)
+```
+
+
+####### Interpolate static water level
+
+```{r}
+gpfit_staticLevel_east_central <- GpGp::fit_model(data_east_central$StaticLevel,
+                               locs = data_east_central[,c("longitude", "latitude")],
+                               covfun_name = "matern_sphere")
+
+plss_covariates_east_central$StaticLevel <-  GpGp::predictions(fit = gpfit_staticLevel_east_central,
+                  locs_pred = plss_covariates_east_central[,c("longitude", "latitude")], 
+                  X_pred = rep(1,nrow(plss_covariates_east_central)))
+```
+
+
+####### get kriging values for plss
+
+```{r}
+plss_krige_values_east_central <- GpGp::predictions(fit = outcome_regression_east_central$gpfit, locs_pred = plss_covariates_east_central[,c("longitude", "latitude")], X_pred = rep(1,nrow(plss_covariates_east_central)))
+```
+
+####### build kernel matrices
+
+```{r}
+RKHS_covariate_names = c("StaticLevel", "crop_type_combine","drainagecl","precipitation","cafolog")
+rec <- recipe(~ ., data = data_east_central_split$data[, RKHS_covariate_names]) %>%
+    step_dummy(all_nominal_predictors()) %>%
+    prep() # This "fits" the preprocessor
+```
+
+```{r}
+plss_kernel_design_matrix_east_central <- bake(rec, new_data = plss_covariates_east_central[,  RKHS_covariate_names])
+
+plss_kernel_design_matrix_east_central <- cbind(plss_kernel_design_matrix_east_central, U = plss_krige_values_east_central)
+plss_kernel_design_matrix_east_central <- scale(plss_kernel_design_matrix_east_central, center = train_means, scale = train_sds)
+```
+
+```{r}
+plss_k_matrix_east_central <- kernelMatrix(rbf, plss_kernel_design_matrix_east_central, kernel_design_matrix)
+plss_k_matrix_east_central <- cbind(rep(1,nrow(plss_k_matrix_east_central)), plss_k_matrix_east_central)
+```
+
+####### generate map
+
+```{r}
+plss_covariates_east_central$policy <- plss_k_matrix_east_central %*% kernel_optim_trt_DB_east_central$par
+```
+
+```{r}
+plss_covariates_east_central_sf <- st_as_sf(plss_covariates_east_central, coords = c('longitude','latitude'), crs=4326)
+```
+
+```{r}
+ggplot()+
+  geom_sf(data = plss_covariates_east_central_sf, aes(color = policy), size = 0.2) +
+  geom_sf(data = counties,color = 'black')+
+  scale_color_viridis_c(option = "plasma",
+                        name = "Minimum Depth (Feet)",
+                        labels = function(breaks) { round(exp(breaks), 0) })+
+  labs(title = "5mg/L Threshold Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+```{r}
+plss_covariates_east_central_sf$U = plss_krige_values_east_central
+```
+
+
+```{r}
+ggplot()+
+  geom_sf(data = plss_covariates_east_central_sf, aes(color = U), size = 0.15) +
+  geom_sf(data = counties,color = 'black')+
+  scale_color_viridis_c(option = "plasma",
+                        name = "Estimation of U",
+                        labels = function(breaks) { round(exp(breaks), 0) })+
+  labs(title = "5mg/L Threshold Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+Boxplot restricted to regions
+
+```{r}
+ggplot(plss_covariates_east_central, aes(x = crop_type_combine, y = policy)) +
+  geom_boxplot() +
+  labs(title = "Policy v.s. Covariate",
+       x = "land use",
+       y = "minimum well depth")
+```
+
+```{r}
+ggplot(plss_covariates_east_central, aes(x = precipitation, y = policy)) +
+  geom_point() +
+  labs(title = "Policy v.s. Covariate",
+       x = "precipitation",
+       y = "minimum well depth")
+```
+
+```{r}
+ggplot(plss_covariates_east_central, aes(x = cafolog, y = policy)) +
+  geom_point() +
+  labs(title = "Minimum Well depth by policy",
+       x = "cafo",
+       y = "minimum well depth")
+```
+
+
+#### Sub-Region Analysis
+
+```{r}
+
+```
+
+
+##### Whole State
+
+```{r}
+ggplot()+
+  geom_sf(data = plss_covariates_south_west_sf, aes(color = policy), size = 0.2) +
+  geom_sf(data = plss_covariates_west_central_sf, aes(color = policy), size = 0.2) +
+  geom_sf(data = plss_covariates_east_central_sf, aes(color = policy), size = 0.2) +
+  geom_sf(data = plss_covariates_south_central_sf, aes(color = policy), size = 0.2) +
+  geom_sf(data = plss_covariates_central_sf, aes(color = policy), size = 0.2) +
+  geom_sf(data = counties,color = 'black') +
+  scale_color_viridis_c(option = "plasma",
+                        name = "Minimum Depth (Feet)",
+                        labels = function(breaks) { round(exp(breaks), 0) })+
+  labs(title = "5mg/L Threshold Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+
+##### visualize covariate at sub-regions
+
+###### data preparation
+
+we get the plss covariate at different sub-region
+
+```{r}
+plss_covariates_sf = st_as_sf(plss_covariates,coords = c('longitude','latitude'),crs=4326)
+```
+
+```{r}
+file_path <- "/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/plss_covariates.csv"
+command <- paste("brctl download", shQuote(file_path))
+system(command)
+plss_covariates <- read.csv(file_path)
+```
+
+```{r}
+# this requires rnaturalearthdata
+counties <- counties(state = "WI", cb = TRUE, year = 2022) # 'cb = TRUE' for cartographic boundary (simplified) version
+counties = counties[,c("NAME","geometry")]
+colnames(counties) = c("County","geometry")
+```
+
+```{r}
+data_central <- data[data$area=="Central",]
+data_south_central <- data[data$area=="South Central",]
+data_west_central <- data[data$area=="West Central",]
+data_east_central <- data[data$area=="East Central",]
+data_south_west <- data[data$area=="South West",]
+
+data_central_sf <- st_as_sf(data_central, coords = c('longitude','latitude'),crs=4326)
+data_south_central_sf <- st_as_sf(data_south_central ,coords = c('longitude','latitude'),crs=4326)
+data_west_central_sf <- st_as_sf(data_west_central, coords = c('longitude','latitude'),crs=4326)
+data_east_central_sf <- st_as_sf(data_east_central, coords = c('longitude','latitude'),crs=4326)
+data_south_west_sf <- st_as_sf(data_south_west, coords = c('longitude','latitude'),crs=4326)
+```
+
+```{r}
+plss_covariates_south_central <- plss_covariates[plss_covariates$County %in% c("Columbia", "Dodge", "Dane", "Jefferson", 
+                                                                               "Green", "Rock"),]
+
+plss_covariates_central <- plss_covariates[plss_covariates$County %in% c("Wood", "Portage", "Waupaca", "Juneau", 
+                                        "Adams", "Waushara", "Marquette", "Green Lake"),]
+
+plss_covariates_east_central <- plss_covariates[plss_covariates$County %in% c("Outagamie", "Winnebago", "Door", "Fond du Lac", 
+                                            "Brown", "Calumet","Sheboygan","Manitowoc","Kewaunee"),]
+
+plss_covariates_west_central <- plss_covariates[plss_covariates$County %in% c("Pepin", "Jackson", "Buffalo", "Trempealeau", 
+                                            "La Crosse", "Monroe", "Eau Claire", "Dunn", "Pierce", "St. Croix"),]
+
+plss_covariates_south_west <- plss_covariates[plss_covariates$County %in% c("Vernon", "Crawford", "Grant", "Richland", 
+                                                                            "Sauk", "Iowa", "Lafayette"),]
+```
+
+```{r}
+plss_covariates_central_sf <- st_as_sf(plss_covariates_central, coords = c('longitude','latitude'),crs=4326)
+plss_covariates_south_central_sf <- st_as_sf(plss_covariates_south_central ,coords = c('longitude','latitude'),crs=4326)
+plss_covariates_west_central_sf <- st_as_sf(plss_covariates_west_central, coords = c('longitude','latitude'),crs=4326)
+plss_covariates_east_central_sf <- st_as_sf(plss_covariates_east_central, coords = c('longitude','latitude'),crs=4326)
+plss_covariates_south_west_sf <- st_as_sf(plss_covariates_south_west, coords = c('longitude','latitude'),crs=4326)
+```
+
+
+```{r}
+counties_south_central <- counties[counties$County %in% c("Columbia", "Dodge", "Dane", "Jefferson", 
+                                                                               "Green", "Rock"),]
+
+counties_central <- counties[counties$County %in% c("Wood", "Portage", "Waupaca", "Juneau", 
+                                        "Adams", "Waushara", "Marquette", "Green Lake"),]
+
+counties_east_central <- counties[counties$County %in% c("Outagamie", "Winnebago", "Door", "Fond du Lac", 
+                                            "Brown", "Calumet","Sheboygan","Manitowoc","Kewaunee"),]
+
+counties_west_central <- counties[counties$County %in% c("Pepin", "Jackson", "Buffalo", "Trempealeau", 
+                                            "La Crosse", "Monroe", "Eau Claire", "Dunn", "Pierce", "St. Croix"),]
+
+counties_south_west <- counties[counties$County %in% c("Vernon", "Crawford", "Grant", "Richland", 
+                                                                            "Sauk", "Iowa", "Lafayette"),]
+```
+
+
+###### sactter plot of policy v.s. well depth
+
+```{r}
+joined_data <- data_central %>%
+  inner_join(plss_covariates_central,
+             by = c("Township", "Range", "Range.Direction", "Section"))
+```
+
+```{r}
+scatter_plot <- joined_data[joined_data$concentration_plus_median>=5,] %>%
+  ggplot(aes(x = logWellDepth, y = policy)) +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", size = 1) +
+  geom_point(alpha = 0.7, color = "darkblue",size = 1) + # Add points
+  # geom_smooth(method = "lm", se = FALSE, color = "red") + # Optional: Add a linear trend line
+  # Specify X-Axis Breaks and Labels
+  scale_x_continuous(
+    breaks = log(c(30, 70, 150, 400)), # <-- NEW: Specify raw break points
+    labels = function(x) {
+      scales::number(exp(x), accuracy = 1)
+    }
+  ) +
+
+  # Specify Y-Axis Breaks and Labels
+  scale_y_continuous(
+    breaks = log(c(20, 100, 400,1500)), # <-- NEW: Specify raw break points
+    labels = function(x) {
+      scales::number(exp(x), accuracy = 1)
+    }
+  ) +
+  coord_cartesian(xlim = c(3.3,6), ylim = c(2.4,8.5)) + 
+  labs(
+    title = "Well Depth Policy v.s. Observed Well Depth in Central Area",
+    x = "Observed WellDepth (Feet)",
+    y = "Well Depth Policy (Feet)"
+  ) +
+  theme_bw() + 
+  theme(
+    # panel.grid.major = element_blank(),
+    # panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black", size = 0.5)
+  )
+
+# Display the plot
+print(scatter_plot)
+```
+
+```{r}
+
+
+# --- Assuming 'joined_data' from the previous step is available ---
+# If you are running this independently, you would load and join your data here.
+
+# 2. Restructure the data to a 'long' format
+# We'll select the two columns of interest and use pivot_longer() to gather them.
+density_data_long <- joined_data[joined_data$concentration_plus_median>=5,] %>%
+  dplyr::select(logWellDepth, policy) %>%
+  pivot_longer(
+    cols = everything(), # Selects all columns (logWellDepth and policy)
+    names_to = "Variable",
+    values_to = "Value"
+  )
+
+
+# 3. Create the density plot
+combined_density_plot <- density_data_long %>%
+  ggplot(aes(x = Value, fill = Variable)) +
+  geom_density(alpha = 0.5) + # alpha controls transparency for overlapping areas
+  scale_x_continuous(
+    name = "Depth (Feet)", # Change the X-axis title here
+    breaks = log(c(20, 100, 400,1500)) ,
+    labels = function(x) {
+      # Exponentiate the value and format to a clean number
+      scales::number(exp(x), accuracy = 1) 
+    }
+  ) +
+  labs(
+    title = "Density Plot of  Well Depth Policy v.s. Observed Well Depth in Central Area",
+    x = "Depth (Feet)",
+    y = "Density",
+    fill = "Variable"
+  ) +
+  theme_bw() +
+  scale_fill_manual(values = c("logWellDepth" = "darkblue", "policy" = "darkgreen"),
+                    labels = c("logWellDepth" = "Well Depth", "policy" = "Policy"))
+
+# Display the plot
+print(combined_density_plot)
+```
+
+###### plot of indirect method
+
+First, we get the indirect method
+
+```{r}
+indirect_policy_central <- compute_indirect_policy(smoothers = smoothers_central$smoothers_RKHS, trt_bounds = depth_range_center, threshold_val = threshold_val, krige_adjust = outcome_regression_central$krige_values, spatial = TRUE)
+
+indirect_policy_test_central <- compute_indirect_policy(smoothers = smoothers_central$smoothers_test_RKHS, trt_bounds = depth_range_center, threshold_val = threshold_val, krige_adjust = outcome_regression_central$krige_values_test, spatial = TRUE)
+```
+
+```{r}
+indirect_central <- rbind(cbind(data_central_split$data[,c("Township", "Range", "Range.Direction", "Section","longitude", "latitude")], indirect_policy = indirect_policy_central, U = outcome_regression_central$krige_values),
+  cbind(data_central_split$data_test[,c("Township", "Range", "Range.Direction", "Section","longitude", "latitude")],  indirect_policy = indirect_policy_test_central, U = outcome_regression_central$krige_values_test))
+
+indirect_central_sf <- st_as_sf(indirect_central,coords = c("longitude", "latitude"),crs = 4326)
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = indirect_central_sf, aes(color = pmin(indirect_policy,log(2000))), size = 1) +
+  geom_sf(data = counties_central,color = "black", size = 1)+
+  scale_color_viridis_c(option = "D",
+                        name = "Indirect Well Depth Policy",
+                        breaks = log(c(10, 100, 500, 1000, 2000)),
+                        labels = function(breaks) { round(exp(breaks), 0)}) +
+  labs(title = "Indirect Well Depth in Central Area") +
+  theme_void()
+  
+```
+
+We want to compare the indirect method and direct method
+
+```{r}
+policy_comparison_central <- inner_join(indirect_central, plss_covariates_central, by = c("Township", "Range", "Range.Direction", "Section","longitude","latitude"))
+policy_comparison_central_sf <- st_as_sf(policy_comparison_central, coords = c("longitude", "latitude"),crs = 4326)
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = policy_comparison_central_sf, aes(color = pmin(indirect_policy,log(2000))), size = 1) +
+  geom_sf(data = counties_central,color = "black", size = 1)+
+  scale_color_viridis_c(option = "D",
+                        name = "Feet",
+                        breaks = log(c(10, 100, 500, 1000, 2000)),
+                        labels = function(breaks) { round(exp(breaks), 0)}) +
+  labs(title = "Indirect Well Depth Policy in Central Area") +
+  theme_void()
+
+ggplot() +
+  geom_sf(data = policy_comparison_central_sf, aes(color = pmin(policy,log(2000))), size = 1) +
+  geom_sf(data = counties_central,color = "black", size = 1)+
+  scale_color_viridis_c(option = "D",
+                        name = "Feet",
+                        breaks = log(c(10, 100, 500, 1000, 2000)),
+                        labels = function(breaks) { round(exp(breaks), 0)}) +
+  labs(title = "Direct Well Depth Policy in Central Area") +
+  theme_void()
+
+
+
+ggplot() +
+  # geom_sf(data = policy_comparison_central_sf, aes(color = exp(pmin(policy,log(2000))) - exp(pmin(indirect_policy,log(2000)))), size = 1) +
+  geom_sf(data = policy_comparison_central_sf, aes(color = (pmin(policy,log(2000))) - (pmin(indirect_policy,log(2000)))), size = 1) +
+  geom_sf(data = counties_central,color = "black", size = 1)+
+  scale_color_gradient2(midpoint = 0,
+                        low = "blue",
+                        mid = "grey90",
+                        high = "red",
+                        name = "log(Feet) Difference"
+                        # breaks = log(c(10, 100, 500, 1000, 2000)),
+                        # labels = function(breaks) { round(exp(breaks), 0)}
+                        ) +
+  labs(title = "Direct Policy Minus Indirect Policy in Central Area") +
+  theme_void()
+  
+```
+
+
+###### Visualize the projection of policy of policy on covariates
+
+```{r}
+table(policy_comparison_central$crop_type_combine)
+```
+
+```{r}
+table(policy_comparison_central$drainagecl)
+```
+
+We need to consider the baseline category of crop and the category of 
+
+```{r}
+# policy_comparison_central$crop_type_combine <- factor(policy_comparison_central$crop_type_combine, levels = c(
+#   "Forest",
+#   "Undefined",
+#   "Corn",
+#   "Soybeans",
+#   "Grass",
+#   "Vegtables",
+#   "Developed"
+# ))
+
+policy_comparison_central$drainagecl <- factor(policy_comparison_central$drainagecl, levels = c(
+  "Very poorly drained",
+  "Poorly drained",
+  "Somewhat poorly drained",
+  "Moderately well drained",
+  "Well drained",
+  "Somewhat excessively drained",
+  "Excessively drained"
+))
+
+policy_comparison_central$crop_type_combine <- relevel(policy_comparison_central$crop_type_combine, ref = "Forest")
+
+policy_comparison_central$precipitation_std <- scale(policy_comparison_central$precipitation)
+policy_comparison_central$StaticLevel_std <- scale(policy_comparison_central$StaticLevel)
+policy_comparison_central$cafolog_std <- scale(policy_comparison_central$precipitation)
+```
+
+```{r}
+# policy_lm <- lm(policy ~ crop_type_combine + precipitation + StaticLevel + drainagecl + U + cafolog, data = policy_comparison_central, contrasts = list(drainagecl = "contr.poly"))
+
+policy_lm <- lm(policy ~ crop_type_combine + precipitation + StaticLevel + drainagecl + U + cafolog, data = policy_comparison_central)
+```
+
+```{r}
+policy_gam <- mgcv::gam(policy ~ crop_type_combine + precipitation + StaticLevel + drainagecl + s(U) + cafolog, data = policy_comparison_central)
+```
+
+```{r}
+summary(policy_lm)
+```
+
+```{r}
+summary(policy_gam)
+```
+
+```{r}
+## for lm
+# 1. Extract and Clean Coefficients
+crop_coeffs <- tidy(policy_lm) %>%
+  filter(str_detect(term, "crop_type_combine") & !str_detect(term, "Undefined")) %>%
+  mutate(
+    # Calculate 95% Confidence Intervals
+    lower = estimate - 1.96 * std.error,
+    upper = estimate + 1.96 * std.error,
+    
+    # Clean up term names: remove the prefix "crop_type_combine"
+    term_clean = str_remove(term, "crop_type_combine")
+  )
+
+# 2. Create the Forest Plot
+crop_plot <- ggplot(crop_coeffs, aes(x = estimate, y = term_clean)) +
+  geom_point(size = 3, color = "darkgreen") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2, color = "darkgreen") +
+  
+  # Add a vertical reference line at 0 (the value for "Forest")
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", size = 0.8) +
+  
+  labs(
+    title = "Effect of Crop Type on Policy (Central Area)",
+    subtitle = "Relative to the 'Forest' base level",
+    x = "Estimated Well Depth Policy Change (Log(Feet))",
+    y = "Crop Type"
+  ) +
+  theme_minimal()
+
+print(crop_plot)
+```
+
+
+```{r}
+### For gam
+# 1. Extract and Clean Coefficients
+crop_coeffs <- tidy(policy_gam, parametric = TRUE) %>%
+  filter(str_detect(term, "crop_type_combine") & !str_detect(term, "Undefined")) %>%
+  mutate(
+    # Calculate 95% Confidence Intervals
+    lower = estimate - 1.96 * std.error,
+    upper = estimate + 1.96 * std.error,
+    
+    # Clean up term names: remove the prefix "crop_type_combine"
+    term_clean = str_remove(term, "crop_type_combine")
+  )
+
+# 2. Create the Forest Plot
+crop_plot <- ggplot(crop_coeffs, aes(x = estimate, y = term_clean)) +
+  geom_point(size = 3, color = "darkgreen") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2, color = "darkgreen") +
+  
+  # Add a vertical reference line at 0 (the value for "Forest")
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", size = 0.8) +
+  
+  labs(
+    title = "Effect of Crop Type on Policy (Central Area)",
+    subtitle = "Relative to the 'Forest' base level",
+    x = "Estimated Well Depth Policy Change (Log(Feet))",
+    y = "Crop Type"
+  ) +
+  theme(
+    panel.grid.major = element_line(color = "gray80", size = 0.5, linetype = "dotted"),
+    panel.grid.minor = element_line(color = "gray90", size = 0.25, linetype = "dotted"),
+    
+    # You are also setting the plot border/axis lines here:
+    axis.line = element_line(color = "black", size = 0.5),
+    # You might want to remove the border box drawn by theme_bw
+    panel.border = element_blank()
+  )
+
+print(crop_plot)
+```
+
+```{r}
+## For lm 
+library(emmeans)
+
+# 1. Calculate Estimated Marginal Means (Predicted Policy)
+# This function automatically:
+# - Holds continuous variables (precipitation, StaticLevel, U, cafolog) at their mean.
+# - Holds the other categorical variable (crop_type_combine) at its reference level ("Forest").
+emm_drainage <- emmeans(policy_lm, ~ drainagecl)
+
+# 2. Convert to data frame for ggplot2
+emm_df <- as.data.frame(emm_drainage) %>%
+  # Ensure the drainage class is recognized as ordered for the plot
+  mutate(drainagecl = factor(drainagecl, 
+                             levels = levels(policy_comparison_central$drainagecl), 
+                             ordered = TRUE))
+
+# 3. Plot the ordered trend
+drainage_plot <- ggplot(emm_df, aes(x = drainagecl, y = emmean)) +
+  # Connect the means with a line to emphasize the trend (group=1 prevents unwanted segmentation)
+  geom_line(aes(group = 1), color = "darkblue", size = 1) + 
+  # Add points for the estimated means
+  geom_point(size = 3, color = "darkblue") +
+  # Add 95% confidence intervals
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2, color = "darkblue") +
+  
+  labs(
+    title = "Well Depth Policy Across Soil Drainage Classes",
+    # subtitle = "Non-linear trend shown across the ordered levels",
+    x = "Soil Drainage Class (Ordered: Very Poorly → Excessively)",
+    y = "Predicted Policy (Estimated Marginal Mean)"
+  ) +
+  theme_minimal() +
+  # Rotate x-axis labels for readability
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(drainage_plot)
+```
+
+```{r}
+## For Gam
+
+# --- Ensure policy_gam is the GAM model object ---
+
+# 1. Calculate Estimated Marginal Means (Predicted Policy) from the GAM
+# The emmeans function handles the polynomial contrasts correctly for GAMs.
+emm_drainage <- emmeans(policy_gam, ~ drainagecl)
+
+# 2. Convert to data frame for ggplot2
+emm_df <- as.data.frame(emm_drainage) %>%
+  # Ensure the drainage class is recognized as ordered for the plot
+  mutate(drainagecl = factor(drainagecl, 
+                             levels = levels(policy_comparison_central$drainagecl), 
+                             ordered = TRUE))
+
+# 3. Plot the ordered trend
+drainage_plot <- ggplot(emm_df, aes(x = drainagecl, y = emmean)) +
+  # Connect the means with a line to emphasize the trend 
+  geom_line(aes(group = 1), color = "darkblue", size = 1) + 
+  # Add points for the estimated means
+  geom_point(size = 3, color = "darkblue") +
+  # Add 95% confidence intervals
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2, color = "darkblue") +
+  
+  labs(
+    title = "Predicted Policy Value Across Soil Drainage Classes (GAM)",
+    subtitle = "Trend adjusted for smooth effects of continuous covariates",
+    x = "Soil Drainage Class (Ordered: Very Poorly → Excessively)",
+    y = "Predicted Policy (Estimated Marginal Mean)"
+  ) +
+  theme_minimal() +
+  # Rotate x-axis labels for readability
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(drainage_plot)
+```
+
+
+```{r}
+draw(policy_gam, select = "s(U)", rug = FALSE, ci_alpha = 0.2) + 
+  geom_line(color = "#0479A8", linewidth = 1.0) +
+  # coord_cartesian(xlim = c(15000, 66000)) +  # Set the visible range for the x-axis
+  labs(
+    title = "",
+    x = "Kriging Value (Gaussian process)", # Set custom x-axis label
+    y = "Depth Policy (Log Feet)"         # Set custom y-axis label
+  )+
+  # theme_minimal() +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        # panel.grid.minor = element_blank()
+        )
+```
+
+
+```{r}
+plot(ggpredict(policy_gam, terms = c("precipitation"))) + 
+  labs(
+    title = "Linear Effect of Precipitation",
+    x = "precipitation (mm/day)",
+    y = "Marginal Average of Policy (Log Feet)"
+  ) +
+  # scale_y_continuous(labels = exp)+
+  theme_bw() # Change the whole theme
+
+plot(ggpredict(policy_gam, terms = c("StaticLevel")))+ 
+  labs(
+    title = "Linear Effect of Static Level",
+    x = "static level (feet)",
+    y = "Marginal Average of Policy (Log Feet)",
+  ) +
+  theme_bw() # Change the whole theme
+plot(ggpredict(policy_gam, terms = c("cafolog")))+ 
+  labs(
+    title = "Linear Effect of CAFO",
+    x = "cafolog (mm/day)",
+    y = "cafo",
+  ) +
+  theme_bw() # Change the whole theme
+```
+
+
+```{r}
+# 1. Generate the predicted effects for your 3 terms
+# This function calculates the predicted values for each term
+all_effects <- ggpredict(policy_gam, terms = c("precipitation", "StaticLevel", "cafolog"))
+
+# 2. Plot the effects
+# This will automatically create a faceted plot with all 3 variables
+plot(all_effects)
+```
+
+###### Visualize the projection of difference between direct and indirect policy on covariates
+
+```{r}
+policy_comparison_central$policy_diff <- policy_comparison_central$policy - policy_comparison_central$indirect_policy 
+```
+
+```{r}
+# policy_diff_lm <- lm(policy_diff ~ crop_type_combine + precipitation + StaticLevel + drainagecl + U + cafolog, data = policy_comparison_central)
+
+policy_diff_gam <- mgcv::gam(policy_diff ~ crop_type_combine + precipitation + StaticLevel + drainagecl + s(U) + cafolog, data = policy_comparison_central)
+# policy_diff_lm <- lm(policy_diff ~ U, data = policy_comparison_central)
+```
+
+```{r}
+summary(policy_diff_gam)
+```
+
+
+```{r}
+summary(policy_gam)
+```
+
+```{r}
+## for lm
+# 1. Extract and Clean Coefficients
+crop_coeffs <- tidy(policy_lm) %>%
+  filter(str_detect(term, "crop_type_combine") & !str_detect(term, "Undefined")) %>%
+  mutate(
+    # Calculate 95% Confidence Intervals
+    lower = estimate - 1.96 * std.error,
+    upper = estimate + 1.96 * std.error,
+    
+    # Clean up term names: remove the prefix "crop_type_combine"
+    term_clean = str_remove(term, "crop_type_combine")
+  )
+
+# 2. Create the Forest Plot
+crop_plot <- ggplot(crop_coeffs, aes(x = estimate, y = term_clean)) +
+  geom_point(size = 3, color = "darkgreen") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2, color = "darkgreen") +
+  
+  # Add a vertical reference line at 0 (the value for "Forest")
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", size = 0.8) +
+  
+  labs(
+    title = "Effect of Crop Type on Policy (Central Area)",
+    subtitle = "Relative to the 'Forest' base level",
+    x = "Estimated Well Depth Policy Change (Log(Feet))",
+    y = "Crop Type"
+  ) +
+  theme_minimal()
+
+print(crop_plot)
+```
+
+
+```{r}
+### For gam
+# 1. Extract and Clean Coefficients
+crop_coeffs <- tidy(policy_gam, parametric = TRUE) %>%
+  filter(str_detect(term, "crop_type_combine") & !str_detect(term, "Undefined")) %>%
+  mutate(
+    # Calculate 95% Confidence Intervals
+    lower = estimate - 1.96 * std.error,
+    upper = estimate + 1.96 * std.error,
+    
+    # Clean up term names: remove the prefix "crop_type_combine"
+    term_clean = str_remove(term, "crop_type_combine")
+  )
+
+# 2. Create the Forest Plot
+crop_plot <- ggplot(crop_coeffs, aes(x = estimate, y = term_clean)) +
+  geom_point(size = 3, color = "darkgreen") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2, color = "darkgreen") +
+  
+  # Add a vertical reference line at 0 (the value for "Forest")
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", size = 0.8) +
+  
+  labs(
+    title = "Effect of Crop Type on Policy (Central Area)",
+    subtitle = "Relative to the 'Forest' base level",
+    x = "Estimated Well Depth Policy Change (Log(Feet))",
+    y = "Crop Type"
+  ) +
+  theme(
+    panel.grid.major = element_line(color = "gray80", size = 0.5, linetype = "dotted"),
+    panel.grid.minor = element_line(color = "gray90", size = 0.25, linetype = "dotted"),
+    
+    # You are also setting the plot border/axis lines here:
+    axis.line = element_line(color = "black", size = 0.5),
+    # You might want to remove the border box drawn by theme_bw
+    panel.border = element_blank()
+  )
+
+print(crop_plot)
+```
+
+###### well depth at different regions
+
+```{r}
+log_limits <- c(log(10), log(2000))
+
+# Example Breaks (you can customize these)
+# Let's use some nice round numbers for the *original* depth: 100, 500, 1000, 2000
+original_depth_breaks <- c(10, 100, 500, 1000, 2000)
+log_breaks <- log(original_depth_breaks)
+
+# 2. Define the common scale object (optional, but cleaner)
+common_scale <- scale_color_viridis_c(
+  option = "plasma",
+  name = "Well Depth (Feet)", # Use the name from the first plot for consistency
+  limits = log_limits,
+  breaks = log_breaks,
+  labels = function(breaks) { round(exp(breaks), 0) }
+)
+```
+
+```{r}
+ggplot()+
+  # geom_sf(data = data_central_sf[data_central_sf$WellDepth!=5027,], aes(color = log(WellDepth)), size = 1.7) +
+  geom_sf(data = data_central_sf, aes(color = log(WellDepth)), size = 1.7) +
+  geom_sf(data = counties_central,color = 'black', size = 1) +
+  # scale_color_viridis_c(option = "plasma",
+  #                       name = "Well Depth (Feet)",
+  #                       labels = function(breaks) { round(exp(breaks), 0) }) +
+  scale_color_viridis_c(option = "D",
+                        name = "Well Depth (Feet)", # Use the name from the first plot for consistency
+                        limits = log_limits,
+                        breaks = log_breaks,
+                        labels = function(breaks) { round(exp(breaks), 0)}) +
+  labs(title = "Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+```{r}
+ggplot()+
+  # geom_sf(data = data_central_sf[data_central_sf$WellDepth!=5027,], aes(color = log(WellDepth)), size = 1.7) +
+  geom_sf(data = data_west_central_sf, aes(color = log(WellDepth)), size = 0.8) +
+  geom_sf(data = counties_west_central,color = 'black', size = 1) +
+  # scale_color_viridis_c(option = "plasma",
+  #                       name = "Well Depth (Feet)",
+  #                       labels = function(breaks) { round(exp(breaks), 0) }) +
+  scale_color_viridis_c(option = "D",
+                        name = "Well Depth (Feet)", # Use the name from the first plot for consistency
+                        limits = c(log(10), log(1000)),
+                        breaks = log(c(10, 100, 500, 1000)),
+                        labels = function(breaks) { round(exp(breaks), 0)}) +
+  labs(title = "Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+
+###### policy map at different regions
+
+I think we need to winsorize the map, how should we winsorize the map
+
+
+```{r}
+plss_covariates_central_sf$policy_clip <- pmax(pmin(log(2000), plss_covariates_central_sf$policy), log(10))
+```
+
+
+```{r}
+ggplot()+
+  # geom_sf(data = plss_covariates_south_west_sf, aes(color = policy), size = 0.2) +
+  # geom_sf(data = plss_covariates_west_central_sf, aes(color = policy), size = 0.2) +
+  # geom_sf(data = plss_covariates_east_central_sf, aes(color = policy), size = 0.2) +
+  # geom_sf(data = plss_covariates_south_central_sf, aes(color = policy), size = 0.2) +
+  geom_sf(data = plss_covariates_central_sf, aes(color = policy_clip), size = 1.7) +
+  geom_sf(data = counties_central,color = 'black', size = 1) +
+  # scale_color_viridis_c(option = "plasma",
+  #                       name = "Minimum Depth (Feet)",
+  #                       labels = function(breaks) { round(exp(breaks), 0) })+
+  scale_color_viridis_c(option = "D",
+                        name = "Well Depth (Feet)", # Use the name from the first plot for consistency
+                        limits = log_limits,
+                        breaks = log_breaks,
+                        labels = function(breaks) { round(exp(breaks), 0)}) +
+  labs(title = "5mg/L Threshold Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+```{r}
+ggplot()+
+  geom_sf(data = plss_covariates_west_central_sf, aes(color = policy), size = 0.8) +
+  geom_sf(data = counties_west_central,color = 'black', size = 1) +
+  # scale_color_viridis_c(option = "plasma",
+  #                       name = "Minimum Depth (Feet)",
+  #                       labels = function(breaks) { round(exp(breaks), 0) })+
+  scale_color_viridis_c(option = "D",
+                        name = "Well Depth (Feet)", # Use the name from the first plot for consistency
+                        limits = c(log(10), log(1000)),
+                        breaks = log(c(10, 100, 500, 1000)),
+                        labels = function(breaks) { round(exp(breaks), 0)}) +
+  labs(title = "5mg/L Threshold Well Depth", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+
+###### nitrate map at different regions
+
+```{r}
+ggplot()+
+  # geom_sf(data = data_central_sf[data_central_sf$WellDepth!=5027,], aes(color = log(WellDepth)), size = 1.7) +
+  geom_sf(data = data_central_sf, aes(color = log(concentration_plus_median+0.5)), size = 1.7) +
+  geom_sf(data = counties_central,color = 'black', size = 1) +
+  # scale_color_viridis_c(option = "plasma",
+  #                       name = "Well Depth (Feet)",
+  #                       labels = function(breaks) { round(exp(breaks), 0) }) +
+  scale_color_viridis_c(option = "plasma",
+                        name = "Nitrate (mg/L)", # Use the name from the first plot for consistency
+                        limits = c(log(1),log(55)),
+                        breaks = log(c(0,5,10,20,35,50)),
+                        labels = function(breaks) {round(exp(breaks), 0)}) +
+  labs(title = "Nitrate Concentration", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+```{r}
+ggplot()+
+  # geom_sf(data = data_central_sf[data_central_sf$WellDepth!=5027,], aes(color = log(WellDepth)), size = 1.7) +
+  geom_sf(data = data_west_central_sf, aes(color = log(concentration_plus_median+0.5)), size = 0.8) +
+  geom_sf(data = counties_west_central,color = 'black', size = 1) +
+  # scale_color_viridis_c(option = "plasma",
+  #                       name = "Well Depth (Feet)",
+  #                       labels = function(breaks) { round(exp(breaks), 0) }) +
+  scale_color_viridis_c(option = "plasma",
+                        name = "Nitrate (mg/L)", # Use the name from the first plot for consistency
+                        limits = c(log(1),log(55)),
+                        breaks = log(c(0,5,10,20,35,55)),
+                        labels = function(breaks) {round(exp(breaks), 0)}) +
+  labs(title = "Nitrate Concentration", x = "Longitude", y = "Latitude") +
+  theme_void()
+```
+
+###### spatial covariate at different regions
+
+####### CAFO Plot
+
+```{r}
+ggplot() +
+  geom_sf(data = counties_central,color = 'black', size = 1) +  
+  geom_sf(data = plss_covariates_central_sf, aes(color= log(cafo+1)),size=1) +
+  scale_color_viridis_c(option = "magma",name = "Ln(CAFO+1)") +  # Color scale
+  labs(title = "CAFO", x = "Longitude", y = "Latitude") +
+  theme_minimal()
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = counties_west_central,color = 'black', size = 1) +  
+  geom_sf(data = plss_covariates_west_central_sf, aes(color= log(cafo+1)),size=1) +
+  scale_color_viridis_c(option = "magma",name = "Ln(CAFO+1)") +  # Color scale
+  labs(title = "CAFO") +
+  theme_void()
+```
+
+
+####### Land Use
+
+
+```{r}
+# land use/crop type
+ggplot() +
+  geom_sf(data = counties_central,color = 'black', size = 1) +  
+  geom_sf(data = plss_covariates_central_sf[!(plss_covariates_central_sf$crop_type_combine %in% c("Undefined","Vegtables","Cover Crop","Other Crop")),], aes(color=crop_type_combine ),size=1) +
+  scale_color_manual(
+    values = c(
+      "Forest" = "darkgreen", 
+      "Grass" = "lightgreen", 
+      "Corn" = "red",  # Make "Corn" stand out with red
+      "Developed" = "gray", 
+      "Soybeans" = "blue",  # Make "Soybeans" stand out with blue
+      "Other Crop" = "orange",  # Make "Other Crop" stand out with orange
+      "Cover Crop" = "brown", 
+      "Vegtables" = "purple"
+    ),
+    name = "Land Use"
+  ) + 
+  # scale_color_viridis_d(option = "plasma", name = "Crop Type") +  # Color scale
+  # labs(title = "Log(Cafo)", x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  labs(title = "Land Use", x = "Longitude", y = "Latitude") +
+  guides(
+    color = guide_legend(
+      keywidth = unit(0.7, "cm"),  # Increase width of the legend squares
+      keyheight = unit(0.7, "cm"),  # Increase height of the legend squares
+      override.aes = list(shape = 15, size = 7)  # Set legend keys to squares (shape 15) and increase size
+    )
+  )
+```
+
+```{r}
+# land use/crop type
+ggplot() +
+  geom_sf(data = counties_west_central,color = 'black', size = 1) +  
+  geom_sf(data = plss_covariates_west_central_sf[!(plss_covariates_west_central_sf$crop_type_combine %in% c("Undefined","Vegtables","Cover Crop","Other Crop")),], aes(color=crop_type_combine ),size=0.7) +
+  scale_color_manual(
+    values = c(
+      "Forest" = "darkgreen", 
+      "Grass" = "lightgreen", 
+      "Corn" = "red",  # Make "Corn" stand out with red
+      "Developed" = "gray", 
+      "Soybeans" = "blue",  # Make "Soybeans" stand out with blue
+      "Other Crop" = "orange",  # Make "Other Crop" stand out with orange
+      "Cover Crop" = "brown", 
+      "Vegtables" = "purple"
+    ),
+    name = "Land Use"
+  ) + 
+  # scale_color_viridis_d(option = "plasma", name = "Crop Type") +  # Color scale
+  # labs(title = "Log(Cafo)", x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  labs(title = "Land Use", x = "Longitude", y = "Latitude") +
+  guides(
+    color = guide_legend(
+      keywidth = unit(0.7, "cm"),  # Increase width of the legend squares
+      keyheight = unit(0.7, "cm"),  # Increase height of the legend squares
+      override.aes = list(shape = 15, size = 7)  # Set legend keys to squares (shape 15) and increase size
+    )
+  )
+```
+
+####### Precipitation Plot
+
+```{r}
+ggplot() +
+  geom_sf(data = counties_central,color = 'black', size = 1,fill = 'white') +  
+  geom_sf(data = plss_covariates_central_sf, aes(color= precipitation),size=1) +
+  scale_color_gradient(low = 'white',  # Light blue
+  high = "skyblue", # Dark blue
+  name = "mm/day")+
+  labs(title = "Precipitation", x = "Longitude", y = "Latitude") +
+  theme_minimal()
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = counties_west_central,color = 'black', size = 1,fill = 'white') +  
+  geom_sf(data = plss_covariates_west_central_sf, aes(color= precipitation),size=1) +
+  scale_color_gradient(low = 'white',  # Light blue
+  high = "skyblue", # Dark blue
+  name = "mm/day")+
+  labs(title = "Precipitation", x = "Longitude", y = "Latitude") +
+  theme_minimal()
+```
+
+####### Soil Drainage Plot
+
+```{r}
+data_factor <- factor(data,
+  levels = c("Excessively drained", "Well drained", "Moderately well drained", "Somewhat poorly drained", "Poorly drained", "Very poorly drained")
+)
+```
+
+```{r}
+# plss_covariates_sf_drainage = plss_covariates_sf[!is.na(plss_covariates_sf$drainagecl),]
+plss_covariates_central_sf$drainagecl = factor(plss_covariates_central_sf$drainagecl,
+  levels = c("Very poorly drained","Poorly drained","Somewhat poorly drained","Moderately well drained","Well drained","Somewhat excessively drained","Excessively drained"))
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = counties_central,color = 'black', size = 1,fill = 'lightgrey') +  
+  geom_sf(data = plss_covariates_central_sf, aes(color=drainagecl),size=1) +
+  scale_color_brewer(palette = "magma", name = "Soil Drainage Level",
+                     labels = c(
+                          "Very poorly drained" = "Very poor",  # Custom label
+                          "Poorly drained" = "Poorly",                  # Custom label
+                          "Somewhat poorly drained" = "Somewhat poor",              # Custom label
+                          "Moderately well drained" = "Moderately well",         # Custom label
+                          "Well drained" = "Well",
+                          "Somewhat excessively drained" = "Somewhat excessive",
+                          "Excessively drained" = "Excessive"
+    )) + 
+  theme_minimal()+
+  guides(
+    color = guide_legend(
+      keywidth = unit(0.7, "cm"),  # Increase width of the legend squares
+      keyheight = unit(0.7, "cm"),  # Increase height of the legend squares
+      override.aes = list(shape = 15, size = 7)  # Set legend keys to squares (shape 15) and increase size
+    )
+  )
+```
+
+
+```{r}
+# plss_covariates_sf_drainage = plss_covariates_sf[!is.na(plss_covariates_sf$drainagecl),]
+plss_covariates_west_central_sf$drainagecl = factor(plss_covariates_west_central_sf$drainagecl,
+  levels = c("Very poorly drained","Poorly drained","Somewhat poorly drained","Moderately well drained","Well drained","Somewhat excessively drained","Excessively drained"))
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = plss_covariates_west_central_sf, aes(color=drainagecl),size=0.7) +
+  geom_sf(data = counties_west_central,color = 'black', size = 1,fill = 'lightgrey') +  
+  scale_color_brewer(palette = "magma", name = "Soil Drainage Level",
+                     labels = c(
+                          "Very poorly drained" = "Very poor",  # Custom label
+                          "Poorly drained" = "Poorly",                  # Custom label
+                          "Somewhat poorly drained" = "Somewhat poor",              # Custom label
+                          "Moderately well drained" = "Moderately well",         # Custom label
+                          "Well drained" = "Well",
+                          "Somewhat excessively drained" = "Somewhat excessive",
+                          "Excessively drained" = "Excessive"
+    )) + 
+  theme_minimal()+
+  guides(
+    color = guide_legend(
+      keywidth = unit(0.7, "cm"),  # Increase width of the legend squares
+      keyheight = unit(0.7, "cm"),  # Increase height of the legend squares
+      override.aes = list(shape = 15, size = 7)  # Set legend keys to squares (shape 15) and increase size
+    )
+  )
+```
+

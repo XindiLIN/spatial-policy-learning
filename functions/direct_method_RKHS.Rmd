@@ -1,0 +1,1011 @@
+---
+title: "direct_method_RKHS"
+author: "Xindi Lin"
+date: "2025-07-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(betareg)
+library(ranger)
+library(mgcv)
+library(kernlab)
+library(glmnet)
+source('data_generation.R')
+```
+
+##### preparation for simulation
+
+```{r}
+set.seed(1998)
+trt_range = c(0,1)
+trt_step = 0.01
+
+epsilon = 1 # expand loss function outside trt-range
+
+#### data generation setting
+range = 0.2
+phi = 10 # precision for beta distribution 
+dim = 4
+nugget = 0.5
+data_linearity = FALSE
+# data_linearity = TRUE 
+## when the outcome regression is linear, the beta distributed is not appropriate for treatment
+## when the outcome regression is linear, the gamma distribution is more appropriate, but gamma distribution might violate positivity 
+
+#### threshold
+
+threshold = 1 # for non-linear simulation, the mean of observed outcome is about one 
+
+#### outcome regression
+
+outcome_fitted_model = 'gam'
+# outcome_fitted_model = 'lm'
+# outcome_fitted_model = 'rf'
+
+
+
+
+### Step 1: Data Generation
+
+data = data_generation_grid_non_randomized(a = 1, d = 50, range = 0.2, phi = 10, nu = 1.5, dim = 4, nugget = 0.5, linear = data_linearity)
+
+#### re-order data
+
+data = reorder_data(data,order = "coordinate")
+
+
+### Step 2: Nuisance Estimation
+
+fit.propensity = betareg(trt ~ x1 + x2 + x3 + x4 | 1, data = data, link = 'logit', link.phi = 'identity')
+# fit.outcome = gam(logy~s(trt)+s(x1)+s(x2)+s(x3)+s(x4),data = data)
+fit.outcome = gam(logy~trt+x1+x2+x3+x4,data = data)
+## check fitted outcome regression model
+# plot(data$logy, fit.outcome$fitted.values, xlab = 'observed outcome',ylab = 'fitted outcome')
+# abline(0,1,col='red')
+
+
+#### Step 3 Fit Gaussian Processes, Kriging Residuals
+
+resid.outcome = data$logy - fit.outcome$fitted.values
+fitGp = fit_model(y = resid.outcome, locs = data[,c('coord_x','coord_y')])
+krige_values = leave_one_out_kriging(data = data, resid = resid.outcome)
+
+# # check fitted GP
+# plot(data$epsilon,krige_values,xlab='true GP',ylab = 'fitted GP')
+# abline(0,1,col='red')
+
+
+### Step 4: Get Pre-computed prediction matrix for integral, and its smoothed version
+
+pred_matrix = get_precompute_pred_matrix(data = data, fit.outcome = fit.outcome, trt_range = trt_range, trt_step = trt_step)
+
+cum_smoothers = build_cumint_smoothers(trt_values, pred_matrix, method = "splinefun", spar = NULL)
+
+smoothers = build_trt_smoothers(trt_values, pred_matrix, smooth_method = "splinefun",spar = NULL)
+
+### Step 5: Get Pre-computed Propensity, and residuals
+
+prop_estimation = get_prop_score(data = data, fit.propensity.beta = fit.propensity, propensity_lower_bound = 0.5)
+# sum(prop_estimation==0.5)
+resids = (data$logy - fit.outcome$fitted.values - krige_values)
+
+```
+
+
+##### beta kernels
+
+```{r}
+#' Beta Kernel Function
+#'
+#' @param y A numeric vector of evaluation points (must be in [0, 1]).
+#' @param x A single numeric value for the kernel's center (must be in (0, 1)).
+#' @param h A single positive numeric value for the bandwidth.
+#'
+#' @return A numeric vector of the kernel density values.
+#'
+beta_kernel <- function(y, x, h) {
+  if (h <= 0) {
+    stop("Bandwidth 'h' must be positive.")
+  }
+  if (x <= 0 || x >= 1) {
+    stop("Center 'x' must be in the interval (0, 1).")
+  }
+  
+  # The shape parameters for the Beta distribution
+  shape1 <- x / h
+  shape2 <- (1 - x) / h
+  
+  # Use R's built-in dbeta function
+  # It correctly returns 0 for any y outside [0, 1].
+  return(dbeta(y, shape1 = shape1, shape2 = shape2))
+}
+```
+
+```{r}
+#' Indefinite Integral of the Beta Kernel (CDF)
+#'
+#' @param t A numeric vector of upper integration limits.
+#' @param x A single numeric value for the kernel's center.
+#' @param h A single positive numeric value for the bandwidth.
+#'
+#' @return A numeric vector of the integral values from 0 to t.
+#'
+integral_kernel_cdf <- function(t, x, h) {
+  if (h <= 0) {
+    stop("Bandwidth 'h' must be positive.")
+  }
+  if (x <= 0 || x >= 1) {
+    stop("Center 'x' must be in the interval (0, 1).")
+  }
+  
+  shape1 <- x / h
+  shape2 <- (1 - x) / h
+  
+  return(pbeta(t, shape1 = shape1, shape2 = shape2))
+}
+```
+
+
+##### integral/derivative of kernel functions
+
+```{r}
+kernel_integral_plus = function(trt,trt_obs,bandwidth){
+  ifelse(trt >= trt_obs-bandwidth, (1 / (2 * bandwidth) * (trt - (trt_obs - bandwidth))), 0)
+}
+
+kernel_integral_plus_derivative = function(trt,trt_obs,bandwidth){
+  ifelse(trt >= trt_obs-bandwidth, (1 / (2 * bandwidth)), 0)
+}
+
+kernel_integral_minus = function(trt,trt_obs,bandwidth){
+  ifelse(trt >= trt_obs+bandwidth, (1 / (2 * bandwidth) * (trt - (trt_obs + bandwidth))), 0)
+}
+
+kernel_integral_minus_derivative = function(trt,trt_obs,bandwidth){
+  ifelse(trt >= trt_obs+bandwidth, (1 / (2 * bandwidth)), 0)
+}
+```
+
+```{r}
+# test integral/derivative of kernel functions
+kernel_integral_plus(trt = c(-0.6,0.5),trt_obs = c(0,0),bandwidth = 0.7) - kernel_integral_minus(trt = c(-0.6,0.5),trt_obs = c(0,0),bandwidth = 0.7)
+
+kernel_integral_minus_derivative(c(0.9,0.6),c(0,0),0.7)
+```
+
+
+##### nu_plus and nu_minus and nu_minus's derivative
+
+```{r}
+nu_plus = function(trt_assigned, trt_obs, scaled_residual, bandwidth, threshold, col_idx, krige_values,trt_range, cum_smoothers){
+  # term of threshold integral
+  term_1 = threshold * (trt_assigned - trt_range[1])
+  
+  # term of doubly adjusted
+  scaled_residual_plus = pmax(0, scaled_residual)
+  scaled_residual_minus = -pmin(0, scaled_residual)
+  kernel_int_plus = kernel_integral_plus(trt = trt_assigned, trt_obs = trt_obs, bandwidth = bandwidth)
+  kernel_int_minus = kernel_integral_minus(trt = trt_assigned, trt_obs = trt_obs, bandwidth = bandwidth)
+    
+  term_2 = scaled_residual_plus * kernel_int_minus + scaled_residual_minus * kernel_int_plus
+  
+  # term of integral of outcome regression
+  term_3 = mapply(
+      FUN = integrate_outcome_gam_storage_smooth, 
+      upper = trt_assigned, 
+      col_idx = col_idx, 
+      krige_value = krige_values, 
+        MoreArgs = list(
+        lower = trt_range[1], # 'lower' is also constant in this case
+        cum_smoothers = cum_smoothers,
+        smooth_type = "cum"
+      )
+    )
+  # here it is plus term_2 not minus term_2
+  if(sum(is.na(term_1 + term_2 - term_3)>0)){
+    cat("NA in nu_plus")
+    browser()
+  }
+  return(term_1 + term_2 - term_3)
+}
+```
+
+```{r}
+nu_plus_derivative = function(trt_assigned, trt_obs, scaled_residual, bandwidth, threshold, col_idx, krige_values,trt_range, smoothers){
+  # term of threshold integral
+  term_1 = rep(threshold, length(trt_assigned))
+  
+  # term of doubly adjusted
+  scaled_residual_plus = pmax(0, scaled_residual)
+  scaled_residual_minus = -pmin(0, scaled_residual)
+  kernel_int_plus_derivative = kernel_integral_plus_derivative(trt = trt_assigned, trt_obs = trt_obs, bandwidth = bandwidth)
+  kernel_int_minus_derivative = kernel_integral_minus_derivative(trt = trt_assigned, trt_obs = trt_obs, bandwidth = bandwidth)
+  
+  term_2 = scaled_residual_minus * kernel_int_plus_derivative + scaled_residual_plus * kernel_int_minus_derivative
+  
+  # term of outcome regression
+  term_3 = mapply(
+      FUN = outcome_gam_storage_smooth, 
+      upper = trt_assigned, 
+      col_idx = col_idx, 
+      krige_value = krige_values, 
+        MoreArgs = list(
+        lower = trt_range[1], # 'lower' is also constant in this case
+        smoothers = smoothers
+      )
+    )
+  # here it is plus term_2 not minus term_2
+  
+  if(sum(is.na(term_1 + term_2 - term_3)>0)){
+    cat("NA in nu_plus_derivative")
+    browser()
+  }
+  return(term_1 + term_2 - term_3)
+}
+```
+
+```{r}
+
+```
+
+
+```{r}
+nu_minus = function(trt_assigned, trt_obs, scaled_residual, bandwidth){
+  # term of doubly adjusted
+  scaled_residual_plus = pmax(0, scaled_residual)
+  scaled_residual_minus = -pmin(0, scaled_residual)
+  kernel_int_plus = kernel_integral_plus(trt = trt_assigned, trt_obs = trt_obs, bandwidth = bandwidth)
+  kernel_int_minus = kernel_integral_minus(trt = trt_assigned, trt_obs = trt_obs, bandwidth = bandwidth)
+    
+  term_2 = scaled_residual_plus * kernel_int_plus + scaled_residual_minus * kernel_int_minus
+  if(sum(is.na(term_2)>0)){
+    cat("NA in nu_minus")
+    browser()
+  }
+  return(term_2)
+}
+
+nu_minus_derivative = function(trt_assigned, trt_obs, scaled_residual, bandwidth){
+  # term of doubly adjusted
+  scaled_residual_plus = pmax(0, scaled_residual)
+  scaled_residual_minus = -pmin(0, scaled_residual)
+  kernel_int_plus_derivative = kernel_integral_plus_derivative(trt = trt_assigned, trt_obs = trt_obs, bandwidth = bandwidth)
+  kernel_int_minus_derivative = kernel_integral_minus_derivative(trt = trt_assigned, trt_obs = trt_obs, bandwidth = bandwidth)
+  
+  term_2 = scaled_residual_plus * kernel_int_plus_derivative + scaled_residual_minus * kernel_int_minus_derivative
+  if(sum(is.na(term_2)>0)){
+    cat("NA in nu_minus_derivative")
+    browser()
+  }
+  return(term_2)
+}
+```
+
+```{r}
+scaled_residuals = resids/prop_estimation
+```
+
+
+```{r}
+# check if it is the same as the previous function
+nu_plus(trt_assigned = c(0.2,0.5), trt_obs = data$trt[c(1,2)], scaled_residual = scaled_residuals[c(1,2)], bandwidth = 0.07, threshold = threshold,col_idx = c(1,2), krige_values = krige_values[c(1,2)], trt_range = trt_range, cum_smoothers = cum_smoothers)
+
+nu_minus(trt_assigned = c(0.2,0.5), trt_obs = data$trt[c(1,2)], scaled_residual = scaled_residuals[c(1,2)], bandwidth = 0.07)
+```
+
+```{r}
+nu_minus_derivative(trt_assigned = c(10,10), trt_obs = data$trt[c(1,2)], scaled_residual = scaled_residuals[c(1,2)], bandwidth = 0.07)
+```
+
+
+```{r}
+trt_1 = 0.5
+trt_2 = 0.45
+
+nu_plus(trt_assigned = c(trt_1), trt_obs = data$trt[c(1)], scaled_residual = scaled_residuals[c(1)], bandwidth = 0.07, threshold = threshold,col_idx = c(1), krige_values = krige_values[c(1)], trt_range = trt_range, cum_smoothers = cum_smoothers)
+
+nu_plus(trt_assigned = c(trt_2), trt_obs = data$trt[c(1)], scaled_residual = scaled_residuals[c(1)], bandwidth = 0.07, threshold = threshold,col_idx = c(1), krige_values = krige_values[c(1)], trt_range = trt_range, cum_smoothers = cum_smoothers)  
+  
+nu_plus(trt_assigned = c(trt_2), trt_obs = data$trt[c(1)], scaled_residual = scaled_residuals[c(1)], bandwidth = 0.07, threshold = threshold,col_idx = c(1), krige_values = krige_values[c(1)], trt_range = trt_range, cum_smoothers = cum_smoothers) + nu_plus_derivative(trt_assigned = c(trt_2), trt_obs = data$trt[c(1)], scaled_residual = scaled_residuals[c(1)], bandwidth = 0.07, threshold = threshold,col_idx = c(1), krige_values = krige_values[c(1)], trt_range = trt_range, smoothers = smoothers) * (trt_1 - trt_2)
+
+```
+
+
+```{r}
+total_loss_db_storage_smooth(trt_assigned = c(0.2,0.2), col_idx = c(1,2), data, krige_values = krige_values[c(1,2)], resids, prop_estimation, cum_smoothers, trt_range, threshold, bandwidth)
+```
+
+##### loss_plus, loss_minus, loss_minus_derivative
+
+```{r}
+total_loss_db_storage_plus =  function(trt_assigned, col_idx, data, krige_values, resids, prop_estimation, cum_smoothers, bandwidth, threshold, epsilon){
+  
+  # preparation
+  
+  ## create the vector to store the loss
+  loss_vec = rep(NA,length(col_idx))
+  ## find the corresponding index
+  index_left_clip = trt_assigned<trt_range[1]
+  index_right_clip = trt_assigned>trt_range[2]
+  index_no_clip = (trt_assigned >= trt_range[1]) & (trt_assigned<=trt_range[2])
+  ## get right clipped trt, this one is used to calculate the integral
+  trt_assigned_right_clipped = pmin(trt_assigned, trt_range[2])
+  
+  
+  scaled_residuals = resids[col_idx]/prop_estimation[col_idx]
+  
+  # calculate the loss for index_left_clip
+  if(sum(index_left_clip)>0){
+    loss_vec[index_left_clip] = -2*epsilon*(trt_assigned[index_left_clip] - trt_range[1])
+  }
+  
+# calculate the loss for index_no_clip, index right clip
+  if(sum(!index_left_clip)>0){
+    loss_vec[!index_left_clip] = nu_plus(trt_assigned = trt_assigned_right_clipped[!index_left_clip], 
+                                        trt_obs = data[col_idx,"trt"][!index_left_clip], 
+                                        scaled_residual = scaled_residuals[!index_left_clip], 
+                                        bandwidth = bandwidth, 
+                                        threshold = threshold,
+                                        col_idx = col_idx[!index_left_clip], 
+                                        krige_values = krige_values[col_idx][!index_left_clip],
+                                        trt_range = trt_range, 
+                                        cum_smoothers = cum_smoothers)
+                                        
+  }
+  
+  
+  
+  if(sum(index_right_clip)>0){
+    # add the right clipped additional loss
+    # pred_matrix is not the input!!
+    epsilon_bar = pmax(threshold - pred_matrix[which(trt_values==trt_range[2]),col_idx][index_right_clip] + abs(scaled_residuals[index_right_clip]/(2*bandwidth)), abs(scaled_residuals[index_right_clip]/(2*bandwidth)))
+    
+    loss_vec[index_right_clip] = loss_vec[index_right_clip] +  (epsilon_bar +2*epsilon)*(trt_assigned[index_right_clip]-trt_range[2])
+    
+  }
+  
+  if(sum(is.na(loss_vec)>0)){
+    cat("NA in total_loss_db_storage_plus")
+    browser()
+  }
+  return(loss_vec)
+}
+
+```
+
+```{r}
+total_loss_db_storage_plus_derivative =  function(trt_assigned, col_idx, data, krige_values, resids, prop_estimation, smoothers, bandwidth, threshold, epsilon){
+  
+  # preparation
+  
+  ## create the vector to store the loss
+  loss_vec = rep(NA,length(col_idx))
+  ## find the corresponding index
+  index_left_clip = trt_assigned<trt_range[1]
+  index_right_clip = trt_assigned>trt_range[2]
+  index_no_clip = (trt_assigned >= trt_range[1]) & (trt_assigned<=trt_range[2])
+  ## get right clipped trt, this one is used to calculate the integral
+  trt_assigned_right_clipped = pmin(trt_assigned, trt_range[2])
+  
+  
+  scaled_residuals = resids[col_idx]/prop_estimation[col_idx]
+  
+  # calculate the loss for index_left_clip
+  if(sum(index_left_clip)>0){
+    loss_vec[index_left_clip] = -2*epsilon
+  }
+  
+# calculate the loss for index_no_clip, index right clip
+  if(sum(!index_left_clip)>0){
+    loss_vec[!index_left_clip] = nu_plus_derivative(trt_assigned = trt_assigned_right_clipped[!index_left_clip], 
+                                        trt_obs = data[col_idx,"trt"][!index_left_clip], 
+                                        scaled_residual = scaled_residuals[!index_left_clip], 
+                                        bandwidth = bandwidth, 
+                                        threshold = threshold,
+                                        col_idx = col_idx[!index_left_clip], 
+                                        krige_values = krige_values[col_idx][!index_left_clip],
+                                        trt_range = trt_range, 
+                                        smoothers = smoothers)
+  }
+  
+  if(sum(index_right_clip)>0){
+    # add the right clipped additional loss
+    
+    epsilon_bar = pmax(threshold - pred_matrix[which(trt_values==trt_range[2]),col_idx][index_right_clip] + abs(scaled_residuals[index_right_clip]/(2*bandwidth)), abs(scaled_residuals[index_right_clip]/(2*bandwidth)))
+    # it should not be
+    # loss_vec[index_right_clip] = loss_vec[index_right_clip] +  (epsilon_bar +2*epsilon)
+    # but rather be 
+    loss_vec[index_right_clip] = epsilon_bar +2*epsilon
+  }
+  
+  if(sum(is.na(loss_vec)>0)){
+    cat("NA in total_loss_db_storage_plus_derivative")
+    browser()
+  }
+  return(loss_vec)
+}
+
+```
+
+```{r}
+1
+```
+
+
+```{r}
+total_loss_db_storage_minus =  function(trt_assigned, col_idx, data, krige_values, resids, prop_estimation,bandwidth,threshold,epsilon){
+  
+  # preparation
+  
+  ## create the vector to store the loss
+  loss_vec = rep(NA,length(col_idx))
+  ## find the corresponding index
+  index_left_clip = trt_assigned<trt_range[1]
+  index_right_clip = trt_assigned>trt_range[2]
+  index_no_clip = (trt_assigned >= trt_range[1]) & (trt_assigned<=trt_range[2])
+  ## get right clipped trt, this one is used to calculate the integral
+  trt_assigned_right_clipped = pmin(trt_assigned, trt_range[2])
+  ## get scaled residual
+  scaled_residuals = resids[col_idx]/prop_estimation[col_idx]
+  
+  # calculate the loss for index_left_clip
+  if(sum(index_left_clip)>0){
+    loss_vec[index_left_clip] = -2*epsilon*(trt_assigned[index_left_clip] - trt_range[1]) - epsilon + epsilon * exp(trt_assigned[index_left_clip] - trt_range[1])
+  }
+  
+# calculate the loss for index_no_clip, index right clip
+  if(sum(!index_left_clip)>0){
+    loss_vec[!index_left_clip] = nu_minus(trt_assigned = trt_assigned_right_clipped[!index_left_clip], 
+                                        trt_obs = data[col_idx,"trt"][!index_left_clip], 
+                                        scaled_residual = scaled_residuals[!index_left_clip], 
+                                        bandwidth = bandwidth)
+  }
+  
+  if(sum(index_right_clip)>0){
+    # add the right clipped additional loss
+    
+    epsilon_bar = pmax(threshold - pred_matrix[which(trt_values==trt_range[2]),col_idx][index_right_clip] + abs(scaled_residuals[index_right_clip]/(2*bandwidth)), abs(scaled_residuals[index_right_clip]/(2*bandwidth)))
+    
+    loss_vec[index_right_clip] = loss_vec[index_right_clip] +  (epsilon_bar +2*epsilon)*(trt_assigned[index_right_clip] - trt_range[2]) - epsilon +epsilon*exp(-trt_assigned[index_right_clip] + trt_range[2])
+  }
+  
+  if(sum(is.na(loss_vec)>0)){
+    cat("NA in total_loss_db_storage_minus")
+    browser()
+  }
+  return(loss_vec)
+}
+
+```
+
+```{r}
+total_loss_db_storage_minus_derivative =  function(trt_assigned, col_idx, data, krige_values, resids, prop_estimation,bandwidth,threshold,epsilon){
+  # preparation
+  ## create the vector to store the loss
+  loss_vec = rep(NA,length(col_idx))
+  ## find the corresponding index
+  index_left_clip = trt_assigned<trt_range[1]
+  index_right_clip = trt_assigned>trt_range[2]
+  index_no_clip = (trt_assigned >= trt_range[1]) & (trt_assigned<=trt_range[2])
+  ## get right clipped trt, this one is used to calculate the integral
+  trt_assigned_right_clipped = pmin(trt_assigned, trt_range[2])
+  ## get scaled residual
+  scaled_residuals = resids[col_idx]/prop_estimation[col_idx]
+  
+  # calculate the loss for index_left_clip
+  if(sum(index_left_clip)>0){
+    loss_vec[index_left_clip] = -2*epsilon + epsilon * exp(trt_assigned[index_left_clip] - trt_range[1])
+  }
+  
+# calculate the loss for index_no_clip, index right clip
+  if(sum(!index_left_clip)>0){
+    
+    loss_vec[!index_left_clip] = nu_minus_derivative(trt_assigned = trt_assigned_right_clipped[!index_left_clip], 
+                                            trt_obs = data[col_idx,"trt"][!index_left_clip], 
+                                            scaled_residual = scaled_residuals[!index_left_clip], 
+                                            bandwidth = bandwidth)
+  }
+  
+  if(sum(index_right_clip)>0){
+    # add the right clipped additional loss
+    
+    epsilon_bar = pmax(threshold - pred_matrix[which(trt_values==trt_range[2]),col_idx][index_right_clip] + abs(scaled_residuals[index_right_clip]/(2*bandwidth)), abs(scaled_residuals[index_right_clip]/(2*bandwidth)))
+    # it should not be
+    # loss_vec[index_right_clip] = loss_vec[index_right_clip] +  (epsilon_bar +2*epsilon) - epsilon*exp(-trt_assigned[index_right_clip]+trt_range[2])
+    # but rather be 
+    loss_vec[index_right_clip] =  (epsilon_bar +2*epsilon) - epsilon*exp(-trt_assigned[index_right_clip]+trt_range[2])
+  }
+  
+  if(sum(is.na(loss_vec)>0)){
+    cat("NA in total_loss_db_storage_minus_derivative")
+    browser()
+  }
+  
+  return(loss_vec)
+  
+}
+```
+
+```{r}
+total_loss_db_storage_plus(trt_assigned = c(2,0.2), col_idx = c(1,2), data, krige_values = krige_values[c(1,2)], resids, prop_estimation, cum_smoothers = cum_smoothers,threshold = threshold,bandwidth = 0.07, epsilon = 1)
+
+total_loss_db_storage_minus(trt_assigned = c(2,0.2), col_idx = c(1,2), data, krige_values = krige_values[c(1,2)], resids, prop_estimation,threshold = threshold,bandwidth = 0.07, epsilon = 1)
+```
+
+
+```{r}
+# early version
+total_loss_db_storage_plus(trt_assigned = c(2,0.5), col_idx = c(1,2), data, krige_values = krige_values[c(1,2)], resids, prop_estimation, cum_smoothers = cum_smoothers,threshold = threshold,bandwidth = 0.07, epsilon = 1)
+
+total_loss_db_storage_minus(trt_assigned = c(2,0.5), col_idx = c(1,2), data, krige_values = krige_values[c(1,2)], resids, prop_estimation,threshold = threshold,bandwidth = 0.07, epsilon = 1)
+```
+
+
+```{r}
+total_loss_db_storage_smooth(trt_assigned = c(2,0.5), col_idx = c(1,2), data, krige_values = krige_values[c(1,2)], resids, prop_estimation, cum_smoothers = cum_smoothers, trt_range = trt_range, threshold = threshold,bandwidth = 0.07)
+```
+
+```{r}
+total_loss_db_storage_minus_derivative(trt_assigned = c(0.2,0.2), col_idx = c(1,2), data, krige_values = krige_values[c(1,2)], resids, prop_estimation, threshold = threshold,bandwidth = 0.07, epsilon = 1)
+```
+
+
+
+```{r}
+# check the loss_minus derivative
+
+trt_1 = 21
+trt_2 = 15
+
+total_loss_db_storage_minus(trt_assigned = c(trt_1), col_idx = c(1), data, krige_values = krige_values[c(1)], resids, prop_estimation, threshold = threshold,bandwidth = 0.07, epsilon = 1)
+
+total_loss_db_storage_minus(trt_assigned = c(trt_2), col_idx = c(1), data, krige_values = krige_values[c(1)], resids, prop_estimation, threshold = threshold,bandwidth = 0.07, epsilon = 1) + total_loss_db_storage_minus_derivative(trt_assigned = c(trt_2), col_idx = c(1), data, krige_values = krige_values[c(1)], resids, prop_estimation, threshold = threshold,bandwidth = 0.07, epsilon = 1) * (trt_1 - trt_2)
+
+total_loss_db_storage_minus_derivative(trt_assigned = c(trt_2), col_idx = c(1), data, krige_values = krige_values[c(1)], resids, prop_estimation, threshold = threshold,bandwidth = 0.07, epsilon = 1)
+
+total_loss_db_storage_minus_derivative(trt_assigned = c(trt_2), col_idx = c(1), data, krige_values = krige_values[c(1)], resids, prop_estimation, threshold = threshold,bandwidth = 0.07, epsilon = 1) * (trt_1 - trt_2)
+```
+We notice that total_loss_db_storage_minus is not only convex, it is actually piecewise linear, so sometimes it is exact.
+
+
+```{r}
+# check the loss_plus derivative
+
+trt_1 = 2
+trt_2 = 1.4
+
+
+total_loss_db_storage_plus(trt_assigned = c(trt_1), col_idx = c(1), data, krige_values = krige_values[c(1)], resids, prop_estimation,cum_smoothers = cum_smoothers, threshold = threshold,bandwidth = 0.07, epsilon = 1)
+
+total_loss_db_storage_plus(trt_assigned = c(trt_2), col_idx = c(1), data, krige_values = krige_values[c(1)], resids, prop_estimation,cum_smoothers = cum_smoothers, threshold = threshold,bandwidth = 0.07, epsilon = 1) + total_loss_db_storage_plus_derivative(trt_assigned = c(trt_2), col_idx = c(1), data, krige_values = krige_values[c(1)], resids, prop_estimation, smoothers = smoothers, threshold = threshold,bandwidth = 0.07, epsilon = 1) * (trt_1 - trt_2)
+
+total_loss_db_storage_plus_derivative(trt_assigned = c(trt_2), col_idx = c(1), data, krige_values = krige_values[c(1)], resids, prop_estimation, smoothers = smoothers, threshold = threshold,bandwidth = 0.07, epsilon = 1) * (trt_1 - trt_2)
+```
+
+##### DC algorithm
+
+
+##### Step of SVM RKHS
+
+```{r}
+# Fix gamma as the median 
+dist_matrix = rdist(data[,c('x1','x2','x3','x4')])
+gamma = median(c(dist_matrix))
+```
+
+
+```{r}
+#' Construct the Kernel Matrix
+#' @param S A matrix of features (X, U).
+#' @param gamma Bandwidth of the RBF kernel.
+#' @return The n x n kernel matrix K.
+construct_kernel_matrix <- function(S, gamma) {
+  rbf <- rbfdot(sigma = 1/(gamma^2))
+  return(kernelMatrix(rbf, S))
+}
+```
+
+###### initialization
+
+```{r}
+initial_values_db_storage_smooth = mclapply(
+  X = 1:nrow(data),
+  FUN = function(idx){
+    optim_result = optim(
+      # Initial guess for the trt_assigned vector
+      par = 0.5, 
+      # The function to minimize
+      fn = total_loss_db_storage_smooth, 
+      # --- Arguments for the optimizer ---
+      # method = "Brent", # Brent only gives two decimal result?
+      method = "L-BFGS-B",
+      lower = 0, # Lower bound for each element is 0
+      upper = 1, # Upper bound for each element is 1
+      col_idx = idx, 
+      data = data, 
+      krige_values = krige_values, 
+      resids = resids, 
+      prop_estimation = prop_estimation, 
+      cum_smoothers = cum_smoothers,
+      trt_range = trt_range,
+      threshold = threshold,
+      bandwidth = bandwidth
+    )
+    return(optim_result$par)
+  }
+)
+```
+
+```{r}
+S = cbind(data[,c('x1','x2','x3','x4')], as.matrix(krige_values))
+K = construct_kernel_matrix(S = as.matrix(S), gamma = gamma)
+
+svm_initial_cv_fit =  cv.glmnet(K, initial_values_db_storage_smooth, alpha = 0)
+```
+
+```{r}
+svm_initial_cv_fit
+```
+
+```{r}
+as.numeric(coef(svm_initial_cv_fit, s = "lambda.min"))
+coef(svm_initial)
+```
+
+```{r}
+params_old = as.numeric(coef(svm_initial_cv_fit, s = "lambda.min"))
+params = as.numeric(coef(svm_initial_cv_fit, s = "lambda.min"))
+```
+
+###### DC loss function
+
+```{r}
+#' Approximation loss function of DC algorithm
+#' @param params initial value of parameters.
+#' @param K The n x n kernel matrix K.
+#' @param gamma Bandwidth of the RBF kernel.
+#' @return The n x n kernel matrix K.
+loss_total_DC_db_storage = function(params, params_old, K, data, krige_values, resids, 
+                                    prop_estimation, lambda, smoothers, cum_smoothers, 
+                                    bandwidth, threshold, epsilon){
+  # print('calculate loss')
+  
+  n = nrow(K)
+  b =  params[1]
+  eta = params[2:(n+1)]
+  trt_assigned = as.vector(K %*% eta + b)
+  
+  eta_old = params_old[2:(n+1)]
+  b_old = params_old[1]
+  trt_assigned_old = as.vector(K %*% eta_old + b_old)
+  
+  
+  L_plus_total = total_loss_db_storage_plus(trt_assigned = trt_assigned, 
+                                            col_idx = 1:n, 
+                                            data = data, 
+                                            krige_values = krige_values, 
+                                            resids = resids, 
+                                            prop_estimation = prop_estimation, 
+                                            cum_smoothers = cum_smoothers,
+                                            bandwidth = bandwidth,
+                                            threshold = threshold,
+                                            epsilon = epsilon)
+  
+  grad_L_minus_total = total_loss_db_storage_minus_derivative(trt_assigned = trt_assigned_old, 
+                                                              col_idx = 1:n, 
+                                                              data = data, 
+                                                              krige_values = krige_values, 
+                                                              resids = resids, 
+                                                              prop_estimation = prop_estimation, 
+                                                              bandwidth = bandwidth,
+                                                              threshold = threshold,
+                                                              epsilon = epsilon)
+        
+  # grad_L_minus_total[is.na(grad_L_minus_total) | is.infinite(grad_L_minus_total)] <- 0
+  
+  val = mean(L_plus_total -  grad_L_minus_total * (trt_assigned - trt_assigned_old)) + (lambda / 2) * (t(eta) %*% K %*% eta)
+  if (val< (-100)){
+    cat('loss_total_DC is way too large')
+    browser() 
+  }
+  
+  if (!is.finite(val)) {
+    
+    cat("NA in loss_total_DC_db_storage")
+    cat("Non-finite loss at params[1:5]:", round(params[1:5], 5), "\n")
+    browser() 
+    val <- 1e10  # Penalize non-finite values heavily
+  }
+  # cat('Value of loss: ',val, '\n')
+  
+  return(as.numeric(val))
+  
+}
+```
+
+```{r}
+# test the DC approximated loss function
+loss_total_DC_db_storage = function(params, params_old, K, data, krige_values, resids, 
+                                    prop_estimation, lambda, smoothers, cum_smoothers, 
+                                    bandwidth, threshold, epsilon)
+  
+trt_assigned_old = as.vector(K %*% eta + b)
+trt_assigned = trt_assigned_old * 1.1
+
+L_plus_total = total_loss_db_storage_plus(trt_assigned = trt_assigned, 
+                                          col_idx = 1:n, 
+                                          data = data, 
+                                          krige_values = krige_values, 
+                                          resids = resids, 
+                                          prop_estimation = prop_estimation, 
+                                          cum_smoothers = cum_smoothers,
+                                          bandwidth = bandwidth,
+                                          threshold = threshold,
+                                          epsilon = epsilon)
+  
+grad_L_minus_total = total_loss_db_storage_minus_derivative(trt_assigned = trt_assigned_old, 
+                                                            col_idx = 1:n, 
+                                                            data = data, 
+                                                            krige_values = krige_values, 
+                                                            resids = resids, 
+                                                            prop_estimation = prop_estimation, 
+                                                            bandwidth = bandwidth,
+                                                            threshold = threshold,
+                                                            epsilon = epsilon)
+
+L_minus_total = total_loss_db_storage_minus(trt_assigned = trt_assigned_old, 
+                                            col_idx = 1:n, 
+                                            data = data, 
+                                            krige_values = krige_values, 
+                                            resids = resids, 
+                                            prop_estimation = prop_estimation, 
+                                            bandwidth = bandwidth,
+                                            threshold = threshold,
+                                            epsilon = epsilon)
+
+a = L_plus_total -  ( L_minus_total + grad_L_minus_total * (trt_assigned - trt_assigned_old ))
+
+b = total_loss_db_storage_smooth(trt_assigned = trt_assigned, col_idx = 1:n, data = data, krige_values = krige_values, resids = resids, prop_estimation = prop_estimation, cum_smoothers = cum_smoothers, trt_range = trt_range, threshold = threshold,bandwidth = 0.07)
+```
+
+```{r}
+plot(b,a)
+```
+
+###### DC loss function derivative
+
+```{r}
+loss_grad_total_DC_db_storage = function(params, params_old, K, data, krige_values, resids,
+                                         prop_estimation, lambda, smoothers, cum_smoothers, bandwidth,
+                                         threshold, epsilon) {
+  n <- nrow(K)
+  b <- params[1]
+  eta <- params[2:(n+1)]
+
+  b_old <- params_old[1]
+  eta_old <- params_old[2:(n+1)]
+
+  trt_assigned     <- as.vector(K %*% eta + b)
+  trt_assigned_old <- as.vector(K %*% eta_old + b_old)
+
+  # Compute gradient of concave part at current params
+  grad_L_plus_total <- total_loss_db_storage_plus_derivative(trt_assigned = trt_assigned,
+                                             col_idx = 1:n,
+                                             data = data,
+                                             krige_values = krige_values,
+                                             resids = resids,
+                                             prop_estimation = prop_estimation,
+                                             smoothers = smoothers,
+                                             bandwidth = bandwidth,
+                                             threshold = threshold,
+                                             epsilon = epsilon)
+  
+  # Compute gradient of concave part at old params
+  grad_L_minus_total_old <- total_loss_db_storage_minus_derivative(trt_assigned = trt_assigned_old,
+                                                               col_idx = 1:n,
+                                                               data = data,
+                                                               krige_values = krige_values,
+                                                               resids = resids,
+                                                               prop_estimation = prop_estimation,
+                                                               bandwidth = bandwidth,
+                                                               threshold = threshold,
+                                                               epsilon = epsilon)
+
+  grad_plus <-  apply(sapply(1:length(grad_L_plus_total), function(i) c(1,K[i,]) * grad_L_plus_total[i]),1,mean)
+  
+  grad_minus <-  apply(sapply(1:length(grad_L_minus_total_old), function(i) c(1, K[i,]) * grad_L_minus_total_old[i]),1,mean)
+  
+  grad_penalty <- c(0,lambda * as.vector(K %*% eta)) 
+  
+  jacobian_trt_assigned <- cbind(rep(1, nrow(K)), K)
+
+  grad_vec <- as.vector(t(grad_L_plus_total -  grad_L_minus_total_old) %*% jacobian_trt_assigned)/n + grad_penalty
+  
+  # grad_vec <- grad_plus + grad_minus + grad_penalty
+                      
+  # if (max(abs(grad_vec))>100){
+  #   cat('grad_loss_total_DC is way too large')
+  #   browser() 
+  # }
+  
+  # Check validity
+  if (any(!is.finite(grad_vec))) {
+    cat("NA in loss_grad_total_DC_db_storage")
+    cat("Non-finite gradient at params[1:5]:", round(params[1:5], 5), "\n")
+    browser()
+    grad_vec[!is.finite(grad_vec)] <- 0
+  }
+
+  return(grad_vec)
+}
+```
+
+
+```{r}
+# test the above function
+
+params_1 = params_old * 1.05
+params_2 = params_old * 1.1
+
+
+loss_total_DC_db_storage(params_2, params_old, K, data, krige_values, resids,
+                                         prop_estimation, lambda, smoothers, cum_smoothers, bandwidth,
+                                         threshold, epsilon)
+
+loss_total_DC_db_storage(params_1, params_old, K, data, krige_values, resids,
+                                         prop_estimation, lambda, smoothers, cum_smoothers, bandwidth,
+                                         threshold, epsilon) +
+sum(loss_grad_total_DC_db_storage(params_1, params_old, K, data, krige_values, resids,
+                                         prop_estimation, lambda, smoothers, cum_smoothers, bandwidth,
+                                         threshold, epsilon) * (params_2 - params_1))
+
+```
+
+```{r}
+sum(loss_grad_total_DC_db_storage(params_1, params_old, K, data, krige_values, resids,
+                                         prop_estimation, lambda, smoothers, cum_smoothers, bandwidth,
+                                         threshold, epsilon) * (params_2 - params_1))
+```
+
+```{r}
+sum(loss_grad_total_DC_db_storage(params_1, params_old, K, data, krige_values, resids,
+                                         prop_estimation, lambda, smoothers, cum_smoothers, bandwidth,
+                                         threshold, epsilon) * (params_2 - params_1))
+```
+
+###### Test for DB loss function
+
+```{r}
+# we first get data from direct
+```
+
+
+###### DC loss function implementation
+
+```{r}
+#' Construct the Kernel Matrix
+#' @param params_init initial value of parameters
+#' @param K kernel matrix used as predictive variables
+#' @param gamma Bandwidth of the RBF kernel.
+#' @return The n x n kernel matrix K.
+run_true_dc_algorithm <- function(params, K, data, krige_values, resids, prop_estimation, lambda, cum_smoothers, smoothers,bandwidth, threshold, epsilon, max_iter = 10, tol = 1e-5){
+    n <- nrow(K)
+    params_old <- params
+
+    cat("--- Starting True Difference of Convex Algorithm ---\n")
+
+    for (k in 1:max_iter) {
+        
+        # Solve the convex subproblem
+        cat(k,'-th iteration of DC algorithm','\n')
+        sub_result <- optim(par = params_old, 
+                            fn = loss_total_DC_db_storage, 
+                            gr = loss_grad_total_DC_db_storage,
+                            params_old = params_old,
+                            K = K, 
+                            lambda = lambda, 
+                            data = data,
+                            krige_values = krige_values, 
+                            resids = resids, 
+                            prop_estimation = prop_estimation, 
+                            cum_smoothers = cum_smoothers,
+                            smoothers = smoothers,
+                            bandwidth = bandwidth,
+                            threshold = threshold,
+                            epsilon = epsilon,
+                            method = "L-BFGS-B", 
+                            control = list(maxit = 300, trace = 3))
+        
+        params <- sub_result$par
+
+        # 3. Check for convergence
+        change <- sqrt(sum((params_old - params)^2))
+        cat(sprintf("Iter: %d, Change: %f, Objective: %f\n", k, change, sub_result$value))
+        
+        if (change < tol) {
+            cat("--- DC Algorithm Converged ---\n")
+            params_old <- params
+            break
+        }
+        
+        params_old <- params
+    }
+    
+    if (k == max_iter) {
+        cat("--- DC Algorithm reached max iterations ---\n")
+    }
+
+    return(list(par = params_old, convergence = ifelse(k < max_iter, 0, 1), iter = k))
+}
+```
+
+```{r}
+dc_result = run_true_dc_algorithm(params = params, 
+                                  K = K, 
+                                  data = data, 
+                                  krige_values = krige_values, 
+                                  resids = resids, 
+                                  prop_estimation = prop_estimation, 
+                                  lambda = lambda, 
+                                  cum_smoothers = cum_smoothers, 
+                                  bandwidth = bandwidth, 
+                                  threshold = threshold, 
+                                  epsilon = epsilon, 
+                                  max_iter = 4, 
+                                  tol = 1e-5)
+```
+```{r}
+plot(params[-1], dc_result$par[-1]) 
+abline(0,1,col = 'red')
+```
+
+
+##### Result Assessment
+
+```{r}
+# get estimated policy
+trt_est = cbind(rep(1, nrow(K)), K) %*% sub_result$par
+# get estimated policy at initial params
+trt_assigned_old = as.vector(K %*% eta_old + b_old)
+
+print('RMSE')
+cat('db parametric:', sqrt(mean(db_error^2)),'\n')
+cat('db RKHS:', sqrt(mean((true_policy-trt_est)^2)),'\n')
+cat('db RKHS initial:', sqrt(mean((true_policy-trt_assigned_old)^2)),'\n')
+
+print('Bias')
+cat('db parametric:', mean(db_error),'\n')
+cat('db RKHS:', mean(true_policy-trt_est),'\n')
+cat('db RKHS initial :', mean(true_policy-trt_assigned_old),'\n')
+
+print('Variance')
+cat('db parametric:', var(db_error),'\n')
+cat('db RKHS:', var(true_policy-trt_est),'\n')
+cat('db initial:', var(true_policy-trt_assigned_old),'\n')
+
+```
+
+```{r}
+plot(true_policy,trt_est, xlab = 'true policy', ylab = 'db predicted policy',cex = 0.5, main = 'RKHS')
+abline(0,1,col = 'red')
+plot(true_policy, model.matrix(param_model_initial_db_storage_smooth) %*% parametric_model_db_storage_smooth$par, xlab = 'true policy', ylab = 'db predicted policy',cex = 0.5, main = 'parametric')
+abline(0,1,col = 'red')
+```
+```{r}
+# difference of initial params and estimated params
+plot(params_old[-1], sub_result$par[-1],cex= 0.5)
+abline(0,1,col='red')
+```
+
+```{r}
+
+```
+
+
+#### cross-validation
+

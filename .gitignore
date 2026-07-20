@@ -1,0 +1,22 @@
+# OS / editor junk
+.DS_Store
+.Rproj.user/
+*.Rproj
+
+# R session/workspace files (not source code)
+.RData
+.RDataTmp
+.Rhistory
+.Rapp.history
+.Renviron
+Rplots.pdf
+
+# macOS iCloud placeholder files (not-yet-downloaded stubs, not real content)
+*.icloud
+
+# Generated/regenerable simulation and analysis outputs -- re-run the scripts to reproduce
+simulation/output/
+nitrate data analysis/output/
+
+# Claude Code local (machine-specific) settings
+.claude/settings.local.json
