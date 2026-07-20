@@ -6,5 +6,5 @@
 #SBATCH -o slurm-%j.out
 
 module reset
-module load R/4.4.1-foss-2022b
+module load R/4.4.2-gfbf-2024a
 Rscript simulation/simulation_nonparametric_run.R
