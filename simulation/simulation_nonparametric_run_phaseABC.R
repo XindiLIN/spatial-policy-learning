@@ -43,6 +43,66 @@ cat(sprintf("Using up to %d cores per phase\n", n_cores))
 
 dir.create("simulation/output", recursive = TRUE, showWarnings = FALSE)
 
+thr_grid <- expand.grid(seed_idx = seq_along(seed_values), threshold_quantile = threshold_quantiles)
+thr_ctxs_path <- 'simulation/output/simulation_nonparametric_thr_ctxs.rds'
+
+# Fields Phase C's run_one_cv_group() actually reads off each per-(seed,threshold) context.
+required_ctx_fields <- c("seed_value", "threshold_quantile", "threshold_val", "data",
+                          "kernel_design_matrix", "kernel_bw_baseline", "fold_id",
+                          "krige_values", "gps_est", "resids", "smoothers", "cumint_smoothers")
+
+# Checks that a loaded thr_ctxs has the right shape, has every field Phase C needs, and that
+# each entry's seed_value/threshold_quantile actually matches what thr_grid says should be at
+# that index -- this catches a stale cache left over from a run with different
+# seed_values/threshold_quantiles settings, not just a truncated/corrupted file.
+validate_thr_ctxs <- function(thr_ctxs, thr_grid, seed_values) {
+  if (!is.list(thr_ctxs) || length(thr_ctxs) != nrow(thr_grid)) {
+    cat(sprintf("thr_ctxs has %s entries, expected %d -- treating as invalid.\n",
+                if (is.list(thr_ctxs)) length(thr_ctxs) else "non-list", nrow(thr_grid)))
+    return(FALSE)
+  }
+  for (i in seq_len(nrow(thr_grid))) {
+    ctx <- thr_ctxs[[i]]
+    if (is.null(ctx) || !is.list(ctx)) {
+      cat(sprintf("thr_ctxs[[%d]] is missing or not a list -- treating as invalid.\n", i))
+      return(FALSE)
+    }
+    if (!all(required_ctx_fields %in% names(ctx))) {
+      cat(sprintf("thr_ctxs[[%d]] is missing field(s): %s -- treating as invalid.\n", i,
+                  paste(setdiff(required_ctx_fields, names(ctx)), collapse = ", ")))
+      return(FALSE)
+    }
+    expected_seed <- seed_values[thr_grid$seed_idx[i]]
+    expected_threshold <- thr_grid$threshold_quantile[i]
+    if (!isTRUE(all.equal(ctx$seed_value, expected_seed))) {
+      cat(sprintf("thr_ctxs[[%d]]$seed_value = %s, expected %s -- treating as invalid.\n", i, ctx$seed_value, expected_seed))
+      return(FALSE)
+    }
+    if (!isTRUE(all.equal(ctx$threshold_quantile, expected_threshold))) {
+      cat(sprintf("thr_ctxs[[%d]]$threshold_quantile = %s, expected %s -- treating as invalid.\n", i, ctx$threshold_quantile, expected_threshold))
+      return(FALSE)
+    }
+  }
+  TRUE
+}
+
+thr_ctxs <- NULL
+if (file.exists(thr_ctxs_path)) {
+  cat(sprintf("Found existing %s -- validating before reuse...\n", thr_ctxs_path))
+  cached_thr_ctxs <- tryCatch(readRDS(thr_ctxs_path), error = function(e) {
+    cat(sprintf("Failed to read %s: %s\n", thr_ctxs_path, conditionMessage(e)))
+    NULL
+  })
+  if (!is.null(cached_thr_ctxs) && validate_thr_ctxs(cached_thr_ctxs, thr_grid, seed_values)) {
+    thr_ctxs <- cached_thr_ctxs
+    cat("thr_ctxs is valid -- skipping phases A and B.\n")
+  } else {
+    cat("Existing thr_ctxs failed validation -- re-running phases A and B.\n")
+  }
+}
+
+if (is.null(thr_ctxs)) {
+
 ## ---- Phase A: per-seed setup ----
 
 get_seed_context <- function(seed_value){
@@ -144,8 +204,6 @@ if (any(failed)) stop(sprintf("Phase A failed for seed(s): %s", paste(seed_value
 
 ## ---- Phase B: per-(seed, threshold) optimal/indirect policies ----
 
-thr_grid <- expand.grid(seed_idx = seq_along(seed_values), threshold_quantile = threshold_quantiles)
-
 get_threshold_context <- function(seed_idx, threshold_quantile){
 
   ctx <- seed_ctxs[[seed_idx]]
@@ -199,7 +257,9 @@ if (any(failed)) stop(sprintf("Phase B failed for task(s): %s", paste(which(fail
 # through -- which, combined with the per-task checkpoint files Phase C writes below, is
 # enough to reconstruct hp_results_all from whatever partial progress exists (see
 # simulation/recover_hp_results_from_partial.R).
-saveRDS(thr_ctxs, file = 'simulation/output/simulation_nonparametric_thr_ctxs.rds')
+saveRDS(thr_ctxs, file = thr_ctxs_path)
+
+} # end of `if (is.null(thr_ctxs))` -- phases A and B
 
 ## ---- Phase C: per-(seed, threshold, m) k-fold CV hyperparameter search ----
 

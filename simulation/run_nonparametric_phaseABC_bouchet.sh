@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -J nonparametric_sim_abc
-#SBATCH -c 64
+#SBATCH -c 32
 #SBATCH --mem=128G
 #SBATCH -t 12:00:00
 #SBATCH -o slurm-abc-%j.out
