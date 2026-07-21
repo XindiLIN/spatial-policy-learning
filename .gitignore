@@ -18,5 +18,8 @@ Rplots.pdf
 simulation/output/
 nitrate_data_analysis/output/
 
+# SLURM job logs (machine/job-specific, not source code)
+slurm-*.out
+
 # Claude Code local (machine-specific) settings
 .claude/settings.local.json
