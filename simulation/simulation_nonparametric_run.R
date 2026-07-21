@@ -236,6 +236,13 @@ for (idx in unique(hp_results_all$thr_idx)) {
   hp_results_all$selected[best] <- TRUE
 }
 
+# Checkpoint: save the CV search results now, before Phase D. Phase D's final
+# refits are far more memory-hungry (full-sample kernel matrices) and can fail
+# independently (e.g. OOM); without this checkpoint, a Phase D failure would
+# discard all of Phase C's already-computed, expensive results.
+dir.create("simulation/output", recursive = TRUE, showWarnings = FALSE)
+saveRDS(hp_results_all, file = 'simulation/output/simulation_nonparametric_hp_results.rds')
+
 ## ---- Phase D: pick winner per (seed, threshold), final refit ----
 
 run_final_fit <- function(thr_idx){

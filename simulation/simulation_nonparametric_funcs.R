@@ -187,7 +187,8 @@ assign_folds <- function(n, n_folds = 5, seed_value){
 # cv_hyperparam_group_for_m). This is the atomic per-fold fit.
 fit_one_fold <- function(k_train, k_holdout, data_ft, T_holdout, Y_holdout,
                           krige_ft, gps_ft, resids_ft, smoothers_ft, cumint_smoothers_ft,
-                          lambda, kernel_bw, threshold_val, trt_bounds = c(-4,4), clip_epsilon = 30){
+                          lambda, kernel_bw, threshold_val, trt_bounds = c(-4,4), clip_epsilon = 30,
+                          maxit = 350){
 
   indirect_policy_DB_ft <- get_indirect_policy(data_ft, trt_bounds = trt_bounds, clip_epsilon = 30, threshold_val,
                                                 krige_values = krige_ft, gps_est = gps_ft, resids = resids_ft, kernel_bw = kernel_bw,
@@ -214,7 +215,7 @@ fit_one_fold <- function(k_train, k_holdout, data_ft, T_holdout, Y_holdout,
                surrogate_type = "Gaussian",
                loss_type = "db",
                method = "L-BFGS-B",
-               control = list(maxit = 350, trace = 0))
+               control = list(maxit = maxit, trace = 0))
 
   holdout_policy <- k_holdout %*% fit$par
 
@@ -230,7 +231,7 @@ cv_hyperparam_group_for_m <- function(m, lambda_lst, kernel_bw_mult_lst, data, k
                                        kernel_bw_baseline, fold_id, n_folds = 5,
                                        threshold_val, trt_bounds = c(-4,4), clip_epsilon = 30,
                                        krige_values, gps_est, resids, smoothers, cumint_smoothers,
-                                       progress_label = NULL){
+                                       progress_label = NULL, maxit = 350){
 
   gamma <- 2^(m) * median(fields::rdist(kernel_design_matrix))
   rbf <- rbfdot(sigma = 1/(gamma^2))
@@ -261,7 +262,7 @@ cv_hyperparam_group_for_m <- function(m, lambda_lst, kernel_bw_mult_lst, data, k
                                         resids_ft = resids[fold_train_idx], smoothers_ft = smoothers[fold_train_idx],
                                         cumint_smoothers_ft = cumint_smoothers[fold_train_idx],
                                         lambda = lambda, kernel_bw = kernel_bw, threshold_val = threshold_val,
-                                        trt_bounds = trt_bounds, clip_epsilon = clip_epsilon)
+                                        trt_bounds = trt_bounds, clip_epsilon = clip_epsilon, maxit = maxit)
     }
 
     grid$acc[g] <- mean(vapply(fold_metrics, `[[`, numeric(1), "acc"))

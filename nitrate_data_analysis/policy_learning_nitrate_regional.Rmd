@@ -1,0 +1,3772 @@
+---
+title: "policy_learning_nitrate_regional"
+author: "Xindi Lin"
+date: "2025-09-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidymodels)
+library(ranger)
+library(SuperLearner)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(WeightIt)
+library(GpGp)
+library(Metrics)
+library(rnaturalearth)
+library(ggplot2)
+library(see)
+library(yardstick)
+library(xgboost)
+library(glmnet)
+library(kernlab)
+library(glmnet)
+library(numDeriv)
+library(MASS)
+```
+
+```{r}
+source('data_generation.R')
+source('funcs_kriging.R')
+source('loss_functions.R')
+source('loss_functions_RKHS.R')
+```
+
+#### load or preprocess data
+
+```{r}
+file_path <- "/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_with_covar_median_well.csv"
+## we will use the one with the proportion
+# file_path <- "/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_latest_with_covar_landuseProp_median_well"
+command <- paste("brctl download", shQuote(file_path))
+system(command)
+data <- read.csv("/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_with_covar_median_well.csv")
+```
+
+#### Add the newly constructed covariates: landuse proportion
+
+```{r}
+df_plss_sections_landuse_prop <- read.csv("/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/plss_sections_landuse_prop.csv")
+```
+
+```{r}
+data <- left_join(data,df_plss_sections_landuse_prop,by = c("Range.Direction", "Township", "Range", "Section")) 
+```
+
+```{r}
+write.csv(data, "/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_latest_with_covar_landuseProp_median_well.csv",row.names = FALSE)
+```
+
+```{r}
+data <- read.csv("/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_latest_with_covar_landuseProp_median_well.csv")
+```
+
+
+I hope these two columns are the same, but it turned out that they are very different.
+If everything works as what I want to do in the data collection, covariate construction process, I think the land use proportion is more accurate. Because when we construct combine, we decrease the resolution of the rasters, and then match the PLSS section.
+
+```{r}
+cbind(data$crop_type_combine, colnames(data[,c("Corn","Soybeans","Vegtables","Other.Crop","Cover.Crop","Grass","Forest","Developed","Undefined")])[max.col(data[,c("Corn","Soybeans","Vegtables","Other.Crop","Cover.Crop","Grass","Forest","Developed","Undefined")])])
+```
+
+```{r}
+# visual check
+colnames(data[,c("Corn","Soybeans","Vegtables","Other.Crop","Cover.Crop","Grass","Forest","Developed","Undefined")])[max.col(data[,c("Corn","Soybeans","Vegtables","Other.Crop","Cover.Crop","Grass","Forest","Developed","Undefined")])][21:50]
+
+data[21:50,c("Corn","Soybeans","Vegtables","Other.Crop","Cover.Crop","Grass","Forest","Developed","Undefined")]
+```
+
+
+But I will visualize the dominant proportion
+
+```{r}
+data$max_landuse_prop = colnames(data[,c("Corn","Soybeans","Vegtables","Other.Crop","Cover.Crop","Grass","Forest","Developed","Undefined")])[max.col(data[,c("Corn","Soybeans","Vegtables","Other.Crop","Cover.Crop","Grass","Forest","Developed","Undefined")])]
+```
+
+```{r}
+usa_states <- ne_states(country = "united states of america", returnclass = "sf")
+wisconsin <- usa_states[usa_states$name == "Wisconsin", ]
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = wisconsin, fill = "white", color = "black") +  # Wisconsin boundary
+  geom_sf(data = st_as_sf(data, coords = c('longitude','latitude'), crs = 4326), aes(color= max_landuse_prop),size=0.1) +
+  scale_color_material()
+  labs(x = "Longitude", y = "Latitude") +
+  theme_minimal()
+```
+
+I think it looks reasonable
+
+
+#### check well Use
+
+```{r}
+table(data$WellUse)
+```
+10mg/L for private wells
+
+5mg/L for public wells, maybe set 5mg/L as the threshold. So the imbalanced issue might be mitigated. 
+
+##### Add historical data as a covariate
+
+Separate data into most recent measurement/the historical measurement at every location (grid). 
+
+Take average/median historical of neighbors in township/range. 
+
+We will first separate the historical data and most recent data
+
+```{r}
+# only by well depth
+latest_records <- data %>%
+  # Make sure the date column is a true Date type for correct sorting
+  mutate(SampleDate = as.Date(SampleDate)) %>%
+  # Group the data by the well ID
+  group_by(WellID) %>%
+  # Within each group, keep only the row with the maximum date
+  slice_max(order_by = SampleDate, n = 1) %>%
+  # Optional: remove the grouping
+  ungroup()
+```
+
+```{r}
+dim(latest_records)
+```
+
+keep the latest record by "welldepth", "latitude", "longitude", "WellUse"
+
+```{r}
+# by sample date
+latest_records_depth <- latest_records %>%
+  # Ensure the date column is a true Date type
+  mutate(SampleDate = as.Date(SampleDate)) %>%
+  # Group by all four identifying columns
+  group_by(WellDepth, latitude, longitude) %>%
+  # Keep the row with the latest date within each group
+  slice_max(order_by = SampleDate, n = 1) %>%
+  ungroup()
+
+## by sample year
+# latest_records_depth <- latest_records %>%
+#   # Ensure the date column is a true Date type
+#   # mutate(SampleDate = as.Date(SampleDate)) %>%
+#   # Group by all four identifying columns
+#   group_by(WellDepth, latitude, longitude) %>%
+#   # Keep the row with the latest date within each group
+#   slice_max(order_by = SampleYear, n = 1) %>%
+#   ungroup()
+```
+
+We will then find the median/mean of the historical nitrate levels within each township/range
+
+```{r}
+data_latest_oldest <- data %>% 
+  mutate(SampleDate = as.Date(SampleDate)) %>%
+  group_by(WellDepth, latitude, longitude, WellUse) %>%
+  mutate(sampling_order = row_number(desc(SampleDate))) %>% 
+  arrange(latitude, longitude, WellDepth, sampling_order) %>% 
+  ungroup()
+```
+
+```{r}
+data_latest <- data_latest_oldest[data_latest_oldest$sampling_order == 1,]
+data_historical <- data_latest_oldest[data_latest_oldest$sampling_order != 1,]
+```
+
+Then, we aggregate the historical result in every township/
+
+```{r}
+# data_historical_agg <-  data_historical %>% 
+#   group_by(Township, Range, Range.Direction) %>% 
+#   mutate(Median_Historical = median(concentration_plus_median)) 
+
+data_historical_agg <- data_historical %>%
+  group_by(Township, Range, Range.Direction) %>%
+  summarise(
+    Median_Historical = median(concentration_plus_median),
+    Count = n(),
+    .groups = 'drop'  # This is good practice to ungroup the result
+  )
+```
+
+We add the aggregated median to the original dataset
+
+```{r}
+data_latest <- data_latest %>% 
+  left_join(data_historical_agg %>% 
+              select(Township, Range, Range.Direction, Median_Historical), 
+            by = c("Township", "Range", "Range.Direction"))
+```
+
+Some blocks do not have historical data. We can simply drop them.
+
+```{r}
+sum(is.na(data_latest$Median_Historical))
+```
+
+```{r}
+data_latest <- na.omit(data_latest)
+```
+
+```{r}
+write.csv(data_latest, "/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_latest_with_covar_landuseProp_histLevel_median_well.csv",row.names = FALSE)
+```
+
+```{r}
+data_latest <- read.csv("/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_latest_with_covar_landuseProp_histLevel_median_well.csv")
+```
+
+
+```{r}
+data <- data_latest
+```
+
+#### remove zero-inflated
+
+```{r}
+data <- data[data$concentration_plus_median!=0.5,]
+```
+
+#### Choose Area
+
+```{r}
+sort(unique(data$County))
+```
+
+```{r}
+data$area = ""
+
+indices_central <- data$County %in% c("Wood", "Portage", "Waupaca", "Juneau", "Adams", "Waushara", "Marquette", "Green Lake")
+data[indices_central, "area"] = "Central"
+
+indices_westCentral <- data$County %in% c("Buffalo", "Trempealeau", "La Crosse", "Monroe")
+data[indices_westCentral, "area"] = "West Central"
+
+indices_southCentral <- data$County %in% c("Columbia", "Dodge", "Dane", "Jefferson", "Green", "Rock")
+data[indices_southCentral, "area"] = "South Central"
+
+indices_eastCentral <- data$County %in% c("Outagamie", "Winnebago", "Door", "Fond du Lac", "Brown", "Calumet","Sheboygan","Manitowoc","Kewaunee")
+data[indices_eastCentral, "area"] = "East Central"
+
+indices_southWest <- data$County %in% c("Vernon", "Crawford", "Grant", "Richland", "Sauk", "Iowa","Lafayette")
+data[indices_southWest, "area"] = "South West"
+
+indices_southEast <- data$County %in% c("Washington", "Waukesha", "Walworth", "Ozaukee", "Milwaukee", "Racine","Kenosha")
+data[indices_southEast, "area"] = "South East"
+```
+
+```{r}
+table(data$area)
+```
+
+
+```{r}
+data <- data[data$area == "Central",]
+data <- data[data$area == "East Central",] # choose this
+data <- data[data$area == "South Central",]
+data <- data[data$area == "South East",]
+data <- data[data$area == "South West",]
+data <- data[data$area == "West Central",]
+```
+
+#### Visualization
+
+##### Distribution of Contaminants and Depth
+
+```{r}
+plot(density(log(data$WellDepth)))
+plot(density(data$WellDepth))
+# so we can roughly assume the log of wellDepth, i.e., the treatment, is normally distributed.
+```
+
+```{r}
+hist(data[data$WellUse %in% c("PRIVATE NON-POTABLE", "PRIVATE POTABLE"), "concentration_plus_median"], main = 'private wells')
+```
+
+```{r}
+plot(density(log(data$concentration_plus_median)))
+```
+
+```{r}
+plot(density(log(data$concentration_plus_median[data$concentration_plus_median!=0.5])))
+```
+
+
+#### Down/sub sampling
+
+
+#### Split to Training and Test Data
+
+```{r}
+set.seed(1998)
+
+data_full <- data
+train_indices <- sample(nrow(data_full), nrow(data_full) * 0.7)
+data <- data_full[train_indices,]
+data_test <- data_full[-train_indices,]
+```
+
+We will define a function to implement the training/test data
+
+#### Estimate nuisance parameter
+
+```{r}
+data$logWellDepth = log(data$WellDepth)
+data$logconcentration_plus_median = log(data$concentration_plus_median)
+data_test$logWellDepth = log(data_test$WellDepth)
+data_test$logconcentration_plus_median = log(data_test$concentration_plus_median)
+```
+
+##### using defined function to collect result comparing data/covariates
+
+```{r}
+# data_full <- data
+```
+
+```{r}
+unique(data_full$area)
+```
+
+```{r}
+covariate_names <- c("logWellDepth","WellUse","crop_type_combine","drainagecl","precipitation","cafolog","StaticLevel")
+sub_region <- "South West"
+seed <- 1998
+```
+
+
+```{r}
+training_test_function <- function(data_full, 
+                                   # spatial = c("GP","Coords","None")
+                                   covariate_names, 
+                                   sub_region = c("Whole","Central","South West","West Central","South Central","South East","East Central"),
+                                   # method = c('xgboost'), 
+                                   seed = 1998){
+  
+  
+  sub_region <- match.arg(sub_region)
+  ## Split to Training and Test Data
+  data <- data_full[data_full$area == sub_region,]
+  set.seed(seed)
+  train_indices <- sample(nrow(data), nrow(data) * 0.7)
+  data_train <- data[train_indices,]
+  data_test <- data[-train_indices,]
+  
+  ## xgboost 
+  ### get design matrix. generate two design matrix separately might incur different column number if one category
+  
+  # 1. Define a recipe that learns from the FULL dataset
+  my_recipe <- recipe(~ ., data = data[, covariate_names]) %>%
+  step_dummy(all_nominal_predictors()) # This creates the dummy variables
+  
+  # 2. "Prep" the recipe. This learns and finalizes the rules (including all factor levels).
+  trained_recipe <- prep(my_recipe)
+  
+  # 3. "Bake" (apply) the trained recipe to your subsets
+  design_matrix <- as.matrix(bake(trained_recipe, new_data = data_train[, covariate_names]))
+  design_matrix_test <- as.matrix(bake(trained_recipe, new_data = data_test[, covariate_names]))
+  
+  # design_matrix <- model.matrix(~ . , data = data_train[, covariate_names])
+  # design_matrix_test <- model.matrix(~ . , data = data_test[, covariate_names])
+  
+  ### select nrounds
+  dtrain <- xgb.DMatrix(data = design_matrix, label = data_train$logconcentration_plus_median)
+
+  params <- list(
+    objective = "reg:squarederror", # Specify regression task
+    eta = 0.1,                      # Learning rate
+    max_depth = 4,                  # Maximum depth of a tree
+    monotone_constraints = c(0, -1, rep(0,15)), # adding this actually improve the performance
+    eval_metric = "rmse"            # The metric to evaluate
+  )
+
+  cv_results <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 400,
+    nfold = 5,
+    early_stopping_rounds = 50, # Stop if performance doesn't improve
+    verbose = 0                 # Suppress verbose output
+  )
+  
+  ### train the model
+  
+  OR_mean_model_xgboost <- xgboost(data = design_matrix, 
+                                   label = data_train$logconcentration_plus_median,
+                                   eta = 0.1,                      # Learning rate
+                                   max_depth = 4, 
+                                   nrounds = cv_results$best_iteration,
+                                   monotone_constraints = c(0, -1, rep(0,15)))
+  
+  ## GP Regression of Residual
+  
+  ### get cross-validation residual
+  loocv_model <- xgb.cv(
+    data = dtrain,
+    nrounds = cv_results$best_iteration,
+    eta = 0.1,                      # Learning rate
+    max_depth = 4, 
+    monotone_constraints = c(0, -1, rep(0,15)),
+    nfold = 10,                 # Key step for LOOCV
+    prediction = TRUE,         # Important: tells the function to return predictions
+    verbose = 0                # Suppress progress messages
+  )
+  
+  gpfit = GpGp::fit_model(data_train$logconcentration_plus_median - loocv_model$pred,
+                        locs = data_train[,c("longitude", "latitude")],
+                        covfun_name = "matern_sphere")
+
+  krige_values <- leave_one_out_kriging(locs = data_train[,c("longitude", "latitude")], 
+                                      y_obs = data_train$logconcentration_plus_median - loocv_model$pred, 
+                                      gp_model = gpfit$covfun_name,
+                                      gp_params = gpfit$covparms,
+                                      order = c("coordinate")) 
+
+  krige_values_test <- GpGp::predictions(fit = gpfit, 
+                       locs_pred = data_test[,c("longitude", "latitude")], 
+                       X_pred = rep(1,nrow(data_test)))
+  
+  ## calculate the training/prediction rMSE
+  
+  ### non-spatial rMSE
+  rmse_train_nonsp <- Metrics::rmse(data_train$logconcentration_plus_median, predict(OR_mean_model_xgboost, design_matrix))
+  rmse_test_nonsp <- Metrics::rmse(data_test$logconcentration_plus_median, predict(OR_mean_model_xgboost, design_matrix_test))
+  
+  ### spatial rMSE
+  rmse_train_sp <- Metrics::rmse(data_train$logconcentration_plus_median, predict(OR_mean_model_xgboost, design_matrix) + krige_values)
+  rmse_test_sp <- Metrics::rmse(data_test$logconcentration_plus_median, predict(OR_mean_model_xgboost, design_matrix_test) + krige_values_test)
+  df_result <- data.frame('Geographic Scope' = rep(sub_region, 2), 'Model Type' = c("With Kriging","No Kriging"),
+             'Training rMSE' = c( rmse_train_sp, rmse_train_nonsp),
+             'Test rMSE' = c(rmse_test_sp, rmse_test_nonsp))
+  return(df_result)
+}  
+```
+
+
+```{r}
+data_whole <- read.csv("/Users/xindilin/Desktop/2024 summer/groundwater_pesticide/data/data_Nitrate_latest_with_covar_landuseProp_median_well.csv")
+```
+
+```{r}
+data_whole$area = ""
+
+indices_central <- data_whole$County %in% c("Wood", "Portage", "Waupaca", "Juneau", "Adams", "Waushara", "Marquette", "Green Lake")
+data_whole[indices_central, "area"] = "Central"
+
+indices_westCentral <- data_whole$County %in% c("Buffalo", "Trempealeau", "La Crosse", "Monroe")
+data_whole[indices_westCentral, "area"] = "West Central"
+
+indices_southCentral <- data_whole$County %in% c("Columbia", "Dodge", "Dane", "Jefferson", "Green", "Rock")
+data_whole[indices_southCentral, "area"] = "South Central"
+
+indices_eastCentral <- data_whole$County %in% c("Outagamie", "Winnebago", "Door", "Fond du Lac", "Brown", "Calumet","Sheboygan","Manitowoc","Kewaunee")
+data_whole[indices_eastCentral, "area"] = "East Central"
+
+indices_southWest <- data_whole$County %in% c("Vernon", "Crawford", "Grant", "Richland", "Sauk", "Iowa","Lafayette")
+data_whole[indices_southWest, "area"] = "South West"
+
+indices_southEast <- data_whole$County %in% c("Washington", "Waukesha", "Walworth", "Ozaukee", "Milwaukee", "Racine","Kenosha")
+data_whole[indices_southEast, "area"] = "South East"
+```
+
+
+```{r}
+data_whole$logWellDepth = log(data_whole$WellDepth)
+data_whole$logconcentration_plus_median = log(data_whole$concentration_plus_median)
+```
+
+for data with prop covariate
+
+```{r}
+for(sub_region in c("Central","South West","West Central","South Central","South East","East Central")){
+  df_result <- training_test_function(data_full = data_whole, 
+                                      covariate_names = c("logWellDepth","WellUse","Corn","Soybeans",
+                                                          "Vegtables","Other.Crop","Cover.Crop",
+                                                          "Grass","Forest","Developed","drainagecl",
+                                                          "precipitation","cafolog","StaticLevel"), 
+                                      sub_region = sub_region)
+  print(df_result)
+  if(sub_region == "Central"){
+    whole_data_prop_result <- df_result
+  } else {
+    whole_data_prop_result <- rbind(whole_data_prop_result, df_result)
+  }
+}
+
+```
+```{r}
+whole_data_prop_result
+```
+
+For data with combined crop
+
+```{r}
+for(sub_region in c("Central","South West","West Central","South Central","South East","East Central")){
+  df_result <- training_test_function(data_full = data_whole, 
+                                      covariate_names = covariate_names, 
+                                      sub_region = sub_region)
+  print(df_result)
+  if(sub_region == "Central"){
+    whole_data_result <- df_result
+  } else {
+    whole_data_result <- rbind(whole_data_result, df_result)
+  }
+}
+
+```
+```{r}
+whole_data_result
+```
+
+Now we want to get result for latest data
+```{r}
+data_latest$area = ""
+
+indices_central <- data_latest$County %in% c("Wood", "Portage", "Waupaca", "Juneau", "Adams", "Waushara", "Marquette", "Green Lake")
+data_latest[indices_central, "area"] = "Central"
+
+indices_westCentral <- data_latest$County %in% c("Buffalo", "Trempealeau", "La Crosse", "Monroe")
+data_latest[indices_westCentral, "area"] = "West Central"
+
+indices_southCentral <- data_latest$County %in% c("Columbia", "Dodge", "Dane", "Jefferson", "Green", "Rock")
+data_latest[indices_southCentral, "area"] = "South Central"
+
+indices_eastCentral <- data_latest$County %in% c("Outagamie", "Winnebago", "Door", "Fond du Lac", "Brown", "Calumet","Sheboygan","Manitowoc","Kewaunee")
+data_latest[indices_eastCentral, "area"] = "East Central"
+
+indices_southWest <- data_latest$County %in% c("Vernon", "Crawford", "Grant", "Richland", "Sauk", "Iowa","Lafayette")
+data_latest[indices_southWest, "area"] = "South West"
+
+indices_southEast <- data_latest$County %in% c("Washington", "Waukesha", "Walworth", "Ozaukee", "Milwaukee", "Racine","Kenosha")
+data_latest[indices_southEast, "area"] = "South East"
+```
+
+```{r}
+data_latest$logWellDepth = log(data_latest$WellDepth)
+data_latest$logconcentration_plus_median = log(data_latest$concentration_plus_median)
+```
+
+
+for crop mode
+
+```{r}
+for(sub_region in c("Central","South West","West Central","South Central","South East","East Central")){
+  df_result <- training_test_function(data_full = data_latest, 
+                                      covariate_names = c("logWellDepth","WellUse","crop_type_combine",
+                                                          "drainagecl","precipitation","cafolog",
+                                                          "StaticLevel", "Median_Historical"), 
+                                      sub_region = sub_region)
+  print(df_result)
+  if(sub_region == "Central"){
+    recent_data_result <- df_result
+  } else {
+    recent_data_result <- rbind(recent_data_result, df_result)
+  }
+}
+
+```
+```{r}
+recent_data_result
+```
+
+for crop proportion
+
+```{r}
+data_latest <- left_join(data_latest, df_plss_sections_landuse_prop,by = c("Range.Direction", "Township", "Range", "Section")) 
+```
+
+```{r}
+for(sub_region in c("West Central","Central","South West","South Central","South East","East Central")){
+  df_result <- training_test_function(data_full = data_latest, 
+                                      covariate_names = c("logWellDepth","WellUse","Corn","Soybeans",
+                                                          "Vegtables","Other.Crop","Cover.Crop",
+                                                          "Grass","Forest","Developed","drainagecl",
+                                                          "precipitation","cafolog","StaticLevel", "Median_Historical"),
+                                      sub_region = sub_region)
+  print(df_result)
+  if(sub_region == "West Central"){
+    recent_data_prop_result <- df_result
+  } else {
+    recent_data_prop_result <- rbind(recent_data_prop_result, df_result)
+  }
+}
+
+```
+
+
+
+
+##### Test if Land Use Proportion Improve the Result
+
+```{r}
+OR_covariate_names <- c("logWellDepth","WellUse","crop_type_combine","drainagecl","precipitation","cafolog","StaticLevel")
+# we drop the proportion of undefined to avoid colinearility with other proportion
+OR_covariate_names_prop <- c("logWellDepth","WellUse","Corn","Soybeans","Vegtables","Other.Crop","Cover.Crop","Grass","Forest","Developed","drainagecl","precipitation","cafolog","StaticLevel")
+```
+
+superlearner is extremely slow, I guess it is cross-validation in SuperLearner
+
+```{r}
+OR_mean_model <- SuperLearner(
+  Y = data$logconcentration_plus_median,
+  X = data[, OR_covariate_names],
+  family = gaussian(),
+  SL.library = c("SL.ranger")
+)
+
+OR_mean_prop_model <- SuperLearner(
+  Y = data$logconcentration_plus_median,
+  X = data[, OR_covariate_names_prop],
+  family = gaussian(),
+  SL.library = c("SL.ranger")
+)
+```
+
+compare training loss plot
+
+```{r}
+plot(log(data$concentration_plus_median), OR_mean_model$library.predict, cex = 0.1)
+abline(0,1,col='red')
+
+plot(log(data$concentration_plus_median), OR_mean_prop_model$library.predict, cex = 0.1)
+abline(0,1,col='red')
+```
+
+compare training rMSE
+
+```{r}
+Metrics::rmse(log(data$concentration_plus_median), OR_mean_model$library.predict)
+
+Metrics::rmse(log(data$concentration_plus_median), OR_mean_prop_model$library.predict)
+```
+
+compare test plot
+
+```{r}
+plot(log(data_test$concentration_plus_median), predict(OR_mean_model, newdata = data_test)$pred)
+abline(0,1,col='red')
+
+plot(log(data_test$concentration_plus_median), predict(OR_mean_prop_model, newdata = data_test)$pred)
+abline(0,1,col='red')
+```
+
+compare test rmse
+
+```{r}
+plot(log(data_test$concentration_plus_median), predict(OR_mean_model, newdata = data_test)$pred)
+abline(0,1,col='red')
+
+plot(log(data_test$concentration_plus_median), predict(OR_mean_prop_model, newdata = data_test)$pred)
+abline(0,1,col='red')
+```
+
+```{r}
+plot(log(data_test$concentration_plus_median), test_OR_pred)
+abline(0,1,col='red')
+```
+
+
+
+##### Cross-validated kernel regression
+
+##### Estimate Outcome Regression: kernel ridge regression (RKHS)
+
+###### Using covariate to form the grand matrix
+
+####### Manually
+
+```{r}
+library(kernlab)
+library(glmnet)
+```
+
+```{r}
+OR_covariate_names <- c("logWellDepth","WellUse","crop_type_combine","drainagecl","precipitation","cafolog","StaticLevel")
+```
+
+```{r}
+design_matrix <- model.matrix(~ . , data = data[, OR_covariate_names])[,-1]
+design_matrix_test <- model.matrix(~ . , data = data_test[, OR_covariate_names])[,-1]
+```
+
+```{r}
+train_means <- colMeans(design_matrix)
+train_sds <- apply(design_matrix, 2, sd)
+
+design_matrix <- scale(design_matrix)
+design_matrix_test <- scale(design_matrix_test, center = train_means, scale = train_sds)
+```
+
+```{r}
+m <- - 1
+gamma <- 2^(m) * median(rdist(design_matrix))
+rbf <- rbfdot(sigma = 1/(gamma^2))
+k_matrix <- kernelMatrix(rbf, design_matrix)
+# build kernel matrix for test data
+k_matrix_test <- kernelMatrix(rbf, design_matrix_test,design_matrix)
+
+# k_matrix <- as.numeric(k_matrix)
+# k_matrix_test <- as.numeric(k_matrix_test)
+```
+
+```{r}
+hist(k_matrix[col(k_matrix)!=row(k_matrix)],xlim = c(0,1))
+```
+
+
+glmnet will automatically add the intercept for us, we we don't need to add the intercept
+
+```{r}
+OR_mean_model_RKHS.cv <- cv.glmnet(x = k_matrix, y = data$logconcentration_plus_median, alpha = 0, keep = TRUE)
+
+OR_mean_model_RKHS <- glmnet(x = k_matrix, y = data$logconcentration_plus_median, alpha = 0, lambda = OR_mean_model_RKHS.cv$lambda.min)
+```
+
+```{r}
+OR_pred_RKHS <- predict(OR_mean_model_RKHS, newx = k_matrix, s=OR_mean_model_RKHS.cv$lambda.min)
+OR_pred_RKHS_test <- predict(OR_mean_model_RKHS, newx = k_matrix_test, s=OR_mean_model_RKHS.cv$lambda.min)
+```
+
+```{r}
+plot(data$logconcentration_plus_median, OR_pred_RKHS, cex = 0.2)
+abline(0,1,col='red')
+
+plot(log(data_test$concentration_plus_median), OR_pred_RKHS_test,cex = 0.2)
+abline(0,1,col='red')
+
+Metrics::rmse(data$logconcentration_plus_median, OR_pred_RKHS)
+Metrics::rmse(log(data_test$concentration_plus_median), OR_pred_RKHS_test)
+```
+
+
+```{r}
+cor(log(data_test$concentration_plus_median), OR_pred_RKHS_test)
+```
+
+
+####### using package
+
+
+```{r}
+library(e1071)
+```
+
+
+
+
+```{r}
+OR_covariate_names <- c("logWellDepth","WellUse","crop_type_combine","drainagecl","precipitation","cafolog","StaticLevel")
+```
+
+```{r}
+design_matrix <- model.matrix(~ . , data = data[, OR_covariate_names])[,-1]
+design_matrix_test <- model.matrix(~ . , data = data_test[, OR_covariate_names])[,-1]
+```
+
+```{r}
+svm_auto <- svm(x = design_matrix, y = data$logconcentration_plus_median, type='nu-regression')
+```
+
+```{r}
+plot(data$logconcentration_plus_median, predict(svm_auto, newdata = design_matrix), cex = 0.2)
+abline(0,1,col='red')
+
+plot(log(data_test$concentration_plus_median), predict(svm_auto, newdata = design_matrix_test), cex = 0.2)
+abline(0,1,col='red')
+
+Metrics::rmse(data$logconcentration_plus_median, predict(svm_auto, newdata = design_matrix))
+Metrics::rmse(log(data_test$concentration_plus_median), predict(svm_auto, newdata = design_matrix_test))
+```
+
+```{r}
+svm_tunning <- e1071::tune.svm(x = design_matrix, y = data$logconcentration_plus_median)
+```
+
+```{r}
+plot(data$logconcentration_plus_median, predict(svm_tunning$best.model, newdata = design_matrix), cex = 0.2)
+abline(0,1,col='red')
+
+plot(log(data_test$concentration_plus_median), predict(svm_tunning$best.model, newdata = design_matrix_test), cex = 0.2)
+abline(0,1,col='red')
+
+Metrics::rmse(data$logconcentration_plus_median, predict(svm_tunning$best.model, newdata = design_matrix))
+Metrics::rmse(log(data_test$concentration_plus_median), predict(svm_tunning$best.model, newdata = design_matrix_test))
+```
+
+
+```{r}
+predict(svm_tunning$best.model, newdata = design_matrix_test)
+```
+
+```{r}
+library(gKRLS)
+```
+
+```{r}
+gam(y ~ s(x1, x2, bs = "krr", k = "rbf"), data = data)
+```
+
+###### Using coordinates to form the grand matrix
+
+```{r}
+
+```
+
+
+##### Estimate Residual using Gaussian Process: RKHS
+
+
+```{r}
+# gpfit_RKHS = GpGp::fit_model(data$logconcentration_plus_median -
+#                                OR_mean_model_RKHS.cv$fit.preval[,which(OR_mean_model_RKHS.cv$lambda==OR_mean_model_RKHS.cv$lambda.min)],
+#                         locs = data[,c("longitude", "latitude")],
+#                         covfun_name = "matern_sphere")
+
+gpfit_RKHS = GpGp::fit_model(svm_auto$residuals,
+                        locs = data[,c("longitude", "latitude")],
+                        covfun_name = "matern_sphere")
+```
+
+```{r}
+# krige_values_RKHS <- leave_one_out_kriging(locs = data[,c("longitude", "latitude")], 
+#                                       y_obs = data$logconcentration_plus_median -
+#                                OR_mean_model_RKHS.cv$fit.preval[,which(OR_mean_model_RKHS.cv$lambda==OR_mean_model_RKHS.cv$lambda.min)], 
+#                                       gp_model = gpfit_RKHS$covfun_name,
+#                                       gp_params = gpfit_RKHS$covparms,
+#                                       order = c("coordinate")) 
+
+krige_values_RKHS <- leave_one_out_kriging(locs = data[,c("longitude", "latitude")], 
+                                      y_obs = svm_auto$residuals, 
+                                      gp_model = gpfit_RKHS$covfun_name,
+                                      gp_params = gpfit_RKHS$covparms,
+                                      order = c("coordinate")) 
+```
+
+```{r}
+krige_values_test_RKHS <- GpGp::predictions(fit = gpfit_RKHS, 
+                      locs_pred = data_test[,c("longitude", "latitude")], 
+                      X_pred = rep(1,nrow(data_test)))
+```
+
+```{r}
+cat('Test rMSE: with kriging: ')
+cat(Metrics::rmse(log(data_test$concentration_plus_median), predict(svm_auto, newdata = design_matrix_test) + krige_values_test_RKHS))
+cat('\n')
+cat('Test rMSE: No kriging: ')
+cat(Metrics::rmse(log(data_test$concentration_plus_median), predict(svm_auto, newdata = design_matrix_test)))
+cat('\n')
+
+cat('Training rMSE: with kriging: ')
+cat(Metrics::rmse(log(data$concentration_plus_median), predict(svm_auto, newdata = design_matrix) + krige_values_RKHS))
+cat('\n')
+cat('Training rMSE: No kriging: ')
+cat(Metrics::rmse(log(data$concentration_plus_median), predict(svm_auto, newdata = design_matrix)))
+cat('\n')
+```
+
+```{r}
+cat('Test rMSE: with kriging: ')
+cat(Metrics::rmse(log(data_test$concentration_plus_median), OR_pred_RKHS_test + krige_values_test_RKHS))
+cat('\n')
+cat('Test rMSE: No kriging: ')
+cat(Metrics::rmse(log(data_test$concentration_plus_median), OR_pred_RKHS_test))
+cat('\n')
+
+cat('Training rMSE: with kriging: ')
+cat(Metrics::rmse(log(data$concentration_plus_median), OR_pred_RKHS + krige_values_RKHS))
+cat('\n')
+cat('Training rMSE: No kriging: ')
+cat(Metrics::rmse(log(data$concentration_plus_median), OR_pred_RKHS))
+cat('\n')
+```
+The improvement is tremendous for RKHS
+
+```{r}
+plot(log(data_test$concentration_plus_median), predict(svm_auto, newdata = design_matrix_test) + krige_values_test_RKHS,cex = 0.2, main = 'kriging test prediction')
+abline(0,1,col='red')
+plot(log(data_test$concentration_plus_median), predict(svm_auto, newdata = design_matrix_test),cex = 0.2, main = ' no kriging test prediction')
+abline(0,1,col='red')
+```
+
+```{r}
+plot(log(data_test$concentration_plus_median), OR_pred_RKHS_test + krige_values_test_RKHS,cex = 0.2, main = 'kriging test prediction')
+abline(0,1,col='red')
+plot(log(data_test$concentration_plus_median), OR_pred_RKHS_test,cex = 0.2, main = ' no kriging test prediction')
+abline(0,1,col='red')
+```
+
+
+It is not easier to predict in small area. It actually depends on which areas we choose
+The GP regression fails in small area. It actually depends on which areas we choose.
+
+##### Compute OR smoothers: RKHS 
+
+This step is very cumbersome for mannually SVM. We might directly use SVM
+
+```{r}
+boundary_tol <- 0
+depth_range <- c(min(data$logWellDepth) - boundary_tol, max(data$logWellDepth) + boundary_tol)
+depth_range
+```
+
+```{r}
+# xgboost use the design matrix
+cf_predictions_RKHS <- precompute_cf_predictions(data_obs = design_matrix, 
+                              fit_outcome = svm_auto,
+                              treatment_range = depth_range,
+                              treatment_step = 0.02,
+                              treatment_name = "logWellDepth")
+```
+
+```{r}
+cf_predictions_RKHS <- isotomic_correction(treatment_grid = cf_predictions_RKHS$treatment_values,
+                                          pred_matrix_cf = cf_predictions_RKHS$pred_matrix)
+```
+
+```{r}
+smoothers_RKHS <- make_prediction_smoothers(treatment_grid = cf_predictions_RKHS$treatment_values,
+                                            pred_matrix_cf = cf_predictions_RKHS$pred_matrix,
+                                            # smooth_method = "gam",
+                                            # smooth_method = "smooth.spline",
+                                            smooth_method = "splinefun",
+                                            spar = NULL)
+```
+
+```{r}
+cumint_smoothers_RKHS <- make_cumint_smoothers(treatment_grid = cf_predictions_RKHS$treatment_values,
+                                            pred_matrix_cf = cf_predictions_RKHS$pred_matrix,
+                                         smooth_method = "splinefun",
+                                         # smooth_method = "gam",
+                                         # smooth_method = "smooth.spline",
+                                         spar = NULL)
+```
+
+```{r}
+# xgboost use the design matrix
+cf_predictions_test_RKHS <- precompute_cf_predictions(data_obs = design_matrix_test, 
+                              fit_outcome = svm_auto,
+                              treatment_range = depth_range,
+                              treatment_step = 0.02,
+                              treatment_name = "logWellDepth")
+```
+
+```{r}
+cf_predictions_test_RKHS <- isotomic_correction(treatment_grid = cf_predictions_test_RKHS$treatment_values,
+                                          pred_matrix_cf = cf_predictions_test_RKHS$pred_matrix)
+```
+
+```{r}
+smoothers_test_RKHS <- make_prediction_smoothers(treatment_grid = cf_predictions_test_RKHS$treatment_values,
+                                            pred_matrix_cf = cf_predictions_test_RKHS$pred_matrix,
+                                            smooth_method = "smooth.spline",
+                                            spar = NULL)
+```
+
+```{r}
+cumint_smoothers_test_RKHS <- make_cumint_smoothers(treatment_grid = cf_predictions_test_RKHS$treatment_values,
+                                               pred_matrix_cf = cf_predictions_test_RKHS$pred_matrix,
+                                               # smooth_method = "splinefun",
+                                               smooth_method = "smooth.spline",
+                                               spar = NULL)
+```
+
+
+We can clearly see that some of it is not monotonically decreasing, so we add iso
+
+```{r}
+i <- 11
+# when i = 20, it decrease first then increase, 
+plot(seq(0,8,length.out = 100), sapply(seq(0,8,length.out = 100), function(knot) {smoothers_RKHS[[i]](knot)}), main = 'Smooth')
+plot(cf_predictions_RKHS$treatment_values, sapply(cf_predictions_RKHS$treatment_values, function(knot) {smoothers_RKHS[[i]](knot)}), main = 'Smoothers RKHS')
+
+plot(cf_predictions_RKHS$treatment_values, sapply(cf_predictions_RKHS$treatment_values, function(knot) {cumint_smoothers_RKHS[[i]](knot)}), main = 'cumint Smoothers RKHS')
+
+plot(cf_predictions_RKHS$treatment_values,  cf_predictions_RKHS$pred_matrix[,i], main = 'Non-smooth original')
+```
+
+```{r}
+mean(sapply(1:nrow(data), function(i){smoothers_RKHS[[i]](depth_range[1])>= log(5)}))
+mean(sapply(1:nrow(data), function(i){smoothers_RKHS[[i]](depth_range[1]) + krige_values_RKHS[i] >= log(5)}))
+```
+
+```{r}
+mean(data$logconcentration_plus_median >= log(5))
+mean(data$logconcentration_plus_median >= log(2))
+```
+
+
+
+##### Estimate Outcome Regression: XGBoost
+
+```{r}
+OR_covariate_names <- c("logWellDepth","WellUse","crop_type_combine","drainagecl","precipitation","cafolog","StaticLevel")
+
+# OR_covariate_names <- c("logWellDepth","WellUse","crop_type_combine","drainagecl","precipitation","cafolog","StaticLevel","Median_Historical")
+
+# OR_covariate_names_prop <- c("logWellDepth","WellUse","Corn","Soybeans","Vegtables","Other.Crop","Cover.Crop","Grass","Forest","Developed","Undefined","drainagecl","precipitation","cafolog","StaticLevel","Median_Historical")
+
+# OR_covariate_names <- c("logWellDepth","precipitation","cafolog","crop_type_combine","drainagecl")
+```
+
+Adding latitude, longitude does not change the prediction result a lot.
+
+```{r}
+design_matrix <- model.matrix(~ . , data = data[, OR_covariate_names])
+design_matrix_test <- model.matrix(~ . , data = data_test[, OR_covariate_names])
+```
+
+we might do cross-validation 
+
+```{r}
+dtrain <- xgb.DMatrix(data = design_matrix, label = data$logconcentration_plus_median)
+
+params <- list(
+  objective = "reg:squarederror", # Specify regression task
+  eta = 0.1,                      # Learning rate
+  max_depth = 4,                  # Maximum depth of a tree
+  monotone_constraints = c(0, -1, rep(0,15)), # adding this actually improve the performance
+  eval_metric = "rmse"            # The metric to evaluate
+)
+
+cv_results <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 400,
+  nfold = 5,
+  early_stopping_rounds = 50, # Stop if performance doesn't improve
+  verbose = 0                 # Suppress verbose output
+)
+```
+
+```{r}
+# 4. Evaluate the results
+print("Cross-validation results (last 5 rounds):")
+# print(tail(cv_results$evaluation_log))
+print((cv_results$evaluation_log))
+
+# Find the best number of rounds based on the lowest test RMSE
+best_iteration <- cv_results$best_iteration
+print(paste("Best iteration:", best_iteration))
+```
+
+
+```{r}
+OR_mean_model_xgboost <- xgboost(data = design_matrix, 
+                                 label = data$logconcentration_plus_median,
+                                 eta = 0.1,                      # Learning rate
+                                 max_depth = 4, 
+                                 # label = data$concentration_plus_median,
+                                 nrounds = cv_results$best_iteration,
+                                 monotone_constraints = c(0, -1, rep(0,15)))
+```
+
+```{r}
+importance_matrix <- xgb.importance(feature_names = colnames(design_matrix), model = OR_mean_model_xgboost)
+xgb.plot.importance(importance_matrix = importance_matrix)
+```
+
+```{r}
+plot(data$logconcentration_plus_median, predict(OR_mean_model_xgboost,design_matrix), cex = 0.2)
+abline(0,1,col='red')
+
+plot(log(data_test$concentration_plus_median), predict(OR_mean_model_xgboost,design_matrix_test),cex = 0.2)
+abline(0,1,col='red')
+
+Metrics::rmse(data$logconcentration_plus_median, predict(OR_mean_model_xgboost,design_matrix))
+Metrics::rmse(log(data_test$concentration_plus_median), predict(OR_mean_model_xgboost,design_matrix_test))
+```
+
+
+```{r}
+cor(log(data_test$concentration_plus_median), predict(OR_mean_model_xgboost, design_matrix_test))
+```
+
+Percentage of agricultural
+
+Separate data into most recent measurement/the historical measurement at every location (grid). 
+
+Take average/median historical of neighbors in township/range. 
+
+Find the region with strong spatial correlation. Subset of the sample. 
+
+##### Estimate Residual using Gaussian Process
+
+```{r}
+set.seed(1998)
+loocv_model <- xgb.cv(
+  data = dtrain,
+  nrounds = cv_results$best_iteration,
+  eta = 0.1,                      # Learning rate
+  max_depth = 4, 
+  monotone_constraints = c(0, -1, rep(0,15)),
+  nfold = 10,                 # Key step for LOOCV
+  prediction = TRUE,         # Important: tells the function to return predictions
+  verbose = 0                # Suppress progress messages
+)
+```
+
+```{r}
+gpfit = GpGp::fit_model(data$logconcentration_plus_median - loocv_model$pred,
+                        locs = data[,c("longitude", "latitude")],
+                        covfun_name = "matern_sphere")
+```
+
+```{r}
+krige_values <- leave_one_out_kriging(locs = data[,c("longitude", "latitude")], 
+                                      y_obs = data$logconcentration_plus_median - loocv_model$pred, 
+                                      gp_model = gpfit$covfun_name,
+                                      gp_params = gpfit$covparms,
+                                      order = c("coordinate")) 
+```
+
+```{r}
+krige_values_test <- GpGp::predictions(fit = gpfit, 
+                      locs_pred = data_test[,c("longitude", "latitude")], 
+                      X_pred = rep(1,nrow(data_test)))
+```
+
+```{r}
+cat('Test rMSE: with kriging: ')
+cat(Metrics::rmse(log(data_test$concentration_plus_median), predict(OR_mean_model_xgboost, design_matrix_test) + krige_values_test))
+cat('\n')
+cat('Test rMSE: No kriging: ')
+cat(Metrics::rmse(log(data_test$concentration_plus_median), predict(OR_mean_model_xgboost, design_matrix_test)))
+cat('\n')
+
+cat('Training rMSE: with kriging: ')
+cat(Metrics::rmse(log(data$concentration_plus_median), predict(OR_mean_model_xgboost, design_matrix) + krige_values))
+cat('\n')
+cat('Training rMSE: No kriging: ')
+cat(Metrics::rmse(log(data$concentration_plus_median), predict(OR_mean_model_xgboost, design_matrix)))
+cat('\n')
+```
+```{r}
+plot(log(data_test$concentration_plus_median), predict(OR_mean_model_xgboost,design_matrix_test) + krige_values_test,cex = 0.2, main = 'kriging test prediction')
+abline(0,1,col='red')
+plot(log(data_test$concentration_plus_median), predict(OR_mean_model_xgboost,design_matrix_test),cex = 0.2, main = ' no kriging test prediction')
+abline(0,1,col='red')
+```
+
+
+It is not easier to predict in small area. It actually depends on which areas we choose
+The GP regression fails in small area. It actually depends on which areas we choose.
+
+##### Compute OR smoothers: XGBoost 
+
+```{r}
+boundary_tol <- 0
+depth_range <- c(min(data$logWellDepth) - boundary_tol, max(data$logWellDepth) + boundary_tol)
+depth_range
+```
+
+```{r}
+# xgboost use the design matrix
+cf_predictions <- precompute_cf_predictions(data_obs = design_matrix, 
+                              fit_outcome = OR_mean_model_xgboost,
+                              treatment_range = depth_range,
+                              treatment_step = 0.02,
+                              treatment_name = "logWellDepth")
+```
+
+```{r}
+smoothers <- make_prediction_smoothers(treatment_grid = cf_predictions$treatment_values,
+                                            pred_matrix_cf = cf_predictions$pred_matrix,
+                                            # smooth_method = "gam",
+                                            smooth_method = "smooth.spline",
+                                            spar = NULL)
+```
+
+```{r}
+cumint_smoothers <- make_cumint_smoothers(treatment_grid = cf_predictions$treatment_values,
+                                         pred_matrix_cf = cf_predictions$pred_matrix,
+                                         smooth_method = "splinefun",
+                                         # smooth_method = "gam",
+                                         # smooth_method = "smooth.spline",
+                                         spar = NULL)
+```
+
+```{r}
+# xgboost use the design matrix
+cf_predictions_test <- precompute_cf_predictions(data_obs = design_matrix_test, 
+                              fit_outcome = OR_mean_model_xgboost,
+                              treatment_range = depth_range,
+                              treatment_step = 0.02,
+                              treatment_name = "logWellDepth")
+```
+
+```{r}
+smoothers_test <- make_prediction_smoothers(treatment_grid = cf_predictions_test$treatment_values,
+                                            pred_matrix_cf = cf_predictions_test$pred_matrix,
+                                            smooth_method = "smooth.spline",
+                                            spar = NULL)
+```
+
+```{r}
+cumint_smoothers_test <- make_cumint_smoothers(treatment_grid = cf_predictions_test$treatment_values,
+                                               pred_matrix_cf = cf_predictions_test$pred_matrix,
+                                               # smooth_method = "splinefun",
+                                               smooth_method = "smooth.spline",
+                                               spar = NULL)
+```
+
+```{r}
+i <- 10
+plot(seq(0,8,length.out = 100), sapply(seq(0,8,length.out = 100), function(knot) {smoothers[[i]](knot)}))
+```
+
+##### Estimate GPS
+
+###### Normal Density
+
+```{r}
+GPS_covariate_names <- c("StaticLevel","WellUse","crop_type_combine","drainagecl","precipitation","cafolog")
+```
+
+```{r}
+gps_mean_model <- SuperLearner(
+  Y = data$logWellDepth,
+  X = data[, GPS_covariate_names],
+  family = gaussian(),
+  SL.library = c("SL.ranger")
+)
+```
+
+```{r}
+gpfit_gps <- GpGp::fit_model(data$logWellDepth - gps_mean_model$Z,
+                        locs = data[,c("longitude", "latitude")],
+                        covfun_name = "matern_sphere")
+```
+
+```{r}
+krige_values_depth <- leave_one_out_kriging(locs = data[,c("longitude", "latitude")], 
+                                      y_obs = data$logWellDepth - gps_mean_model$Z, 
+                                      gp_model = gpfit_gps$covfun_name,
+                                      gp_params = gpfit_gps$covparms,
+                                      order = c("coordinate")) 
+```
+
+```{r}
+krige_values_depth_test <- GpGp::predictions(fit =  gpfit_gps, 
+                      locs_pred = data_test[,c("longitude", "latitude")], 
+                      X_pred = rep(1,nrow(data_test)))
+```
+
+```{r}
+Metrics::rmse(data_test$logWellDepth, predict(gps_mean_model, data_test[, GPS_covariate_names])$pred + krige_values_depth_test)
+Metrics::rmse(data_test$logWellDepth, predict(gps_mean_model, data_test[, GPS_covariate_names])$pred)
+```
+
+Plot the result
+
+```{r}
+# visualize the residual of the fitted value
+plot(data$logWellDepth, gps_mean_model$SL.predict)
+abline(0,1,col='red')
+
+# visualize the error of prediction
+plot(data_test$logWellDepth, predict(gps_mean_model, data_test[, GPS_covariate_names])$pred)
+abline(0,1,col='red')
+
+# visualize the error of prediction
+plot(data_test$logWellDepth, predict(gps_mean_model, data_test[, GPS_covariate_names])$pred + krige_values_depth_test)
+abline(0,1,col='red')
+```
+
+
+```{r}
+gps_sigma = sd(data$logWellDepth - gps_mean_model$Z)
+gps_sigma
+gps_sigma = sd(data$logWellDepth - gps_mean_model$Z - krige_values_depth)
+gps_sigma
+```
+
+
+###### GPS: Covariate Balancing
+
+```{r}
+library(independenceWeights)
+```
+
+```{r}
+weights <- independence_weights(A = data$logWellDepth, X = data[, GPS_covariate_names])
+```
+
+```{r}
+plot(weights$weights,1/gps_est)
+```
+
+```{r}
+library(WeightIt)
+```
+
+```{r}
+weights_cbps <- weightit(logWellDepth ~ StaticLevel+WellUse+crop_type_combine+drainagecl+precipitation+cafolog, 
+                         data = data, method = "cbps")
+```
+
+```{r}
+plot(weights_cbps$weights, weights$weights)
+```
+
+
+#### indirect method
+
+```{r}
+# threshold_val = log(10)
+threshold_val = log(5)
+# threshold_val = log(3)
+```
+
+Approximately 1:3, should we do stratified sample splitting when we split train/test data
+
+```{r}
+table(data$logconcentration_plus_median<=threshold_val)
+table(data_test$logconcentration_plus_median<=threshold_val)
+```
+
+##### indirect method by OR: RKHS
+
+###### non-spatial
+
+get non-spatial policy
+
+```{r}
+indirect_policy_nonsp_RKHS <- sapply(1:nrow(data), function(i) {
+  if(smoothers_RKHS[[i]](depth_range[1])<= threshold_val) return(depth_range[1])
+  if(smoothers_RKHS[[i]](depth_range[2]) > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers_RKHS[[i]](t)- threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+```{r}
+indirect_policy_nonsp_test_RKHS <- sapply(1:nrow(data_test), function(i) {
+  if(smoothers_test_RKHS[[i]](depth_range[1])<= threshold_val) return(depth_range[1])
+  if(smoothers_test_RKHS[[i]](depth_range[2]) > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers_test_RKHS[[i]](t)- threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+get non-spatial policy evaluation
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy_nonsp_RKHS > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor(indirect_policy_nonsp_RKHS > data$logWellDepth))
+```
+
+```{r}
+Metrics::accuracy(log(data_test$concentration_plus_median) > threshold_val, indirect_policy_nonsp_test_RKHS > data_test$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data_test$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_nonsp_test_RKHS > data_test$logWellDepth))
+```
+
+###### spatial indirect
+
+```{r}
+indirect_policy_RKHS <- sapply(1:nrow(data), function(i) {
+  # if lower bound can alreay be lower than the threshold (satisfy the ES), we have to use lower bound
+  if(smoothers_RKHS[[i]](depth_range[1]) + krige_values_RKHS[i] <= threshold_val) return(depth_range[1])
+  # if even upper bound can not be lower than the threshold, we have to use upper bound
+  if(smoothers_RKHS[[i]](depth_range[2]) + krige_values_RKHS[i] > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers_RKHS[[i]](t) + krige_values_RKHS[i] - threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+
+```{r}
+indirect_policy_test_RKHS <- sapply(1:nrow(data_test), function(i) {
+  if(smoothers_test_RKHS[[i]](depth_range[1]) + krige_values_test_RKHS[i]<= threshold_val) return(depth_range[1])
+  if(smoothers_test_RKHS[[i]](depth_range[2]) + krige_values_test_RKHS[i] > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers_test_RKHS[[i]](t) + krige_values_test_RKHS[i] - threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy_RKHS > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_RKHS > data$logWellDepth))
+```
+
+```{r}
+Metrics::accuracy(log(data_test$concentration_plus_median) > threshold_val, indirect_policy_test_RKHS > data_test$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data_test$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_test_RKHS > data_test$logWellDepth))
+```
+
+##### indirect method by OR: gradient boost
+
+```{r}
+plot(log(data$concentration_plus_median), predict(OR_mean_model_xgboost, design_matrix) + krige_values, cex = 0.2, main = "nitrate prediction: training data")
+abline(0,1,col='lightblue')
+abline(h = threshold_val,col='lightblue')
+abline(v = threshold_val,col='lightblue')
+
+plot(log(data_test$concentration_plus_median), predict(OR_mean_model_xgboost, design_matrix_test) + krige_values_test, cex = 0.2, main = "nitrate prediction: test data")
+abline(0,1,col='lightblue')
+abline(h = threshold_val,col='lightblue')
+abline(v = threshold_val,col='lightblue')
+```
+
+###### non-spatial
+
+get non-spatial policy
+
+```{r}
+indirect_policy_nonsp <- sapply(1:nrow(data), function(i) {
+  if(smoothers[[i]](depth_range[1])<= threshold_val) return(depth_range[1])
+  if(smoothers[[i]](depth_range[2]) > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers[[i]](t)- threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+```{r}
+indirect_policy_nonsp_test <- sapply(1:nrow(data_test), function(i) {
+  if(smoothers_test[[i]](depth_range[1])<= threshold_val) return(depth_range[1])
+  if(smoothers_test[[i]](depth_range[2]) > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers_test[[i]](t)- threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+get non-spatial policy evaluation
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy_nonsp > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor(indirect_policy_nonsp > data$logWellDepth))
+```
+
+```{r}
+Metrics::accuracy(log(data_test$concentration_plus_median) > threshold_val, indirect_policy_nonsp_test > data_test$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data_test$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_nonsp_test > data_test$logWellDepth))
+```
+
+###### spatial indirect
+
+```{r}
+indirect_policy <- sapply(1:nrow(data), function(i) {
+  # if lower bound can alreay be lower than the threshold (satisfy the ES), we have to use lower bound
+  if(smoothers[[i]](depth_range[1]) + krige_values[i] <= threshold_val) return(depth_range[1])
+  # if even upper bound can not be lower than the threshold, we have to use upper bound
+  if(smoothers[[i]](depth_range[2]) + krige_values[i] > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers[[i]](t) + krige_values[i] - threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+
+```{r}
+indirect_policy_test <- sapply(1:nrow(data_test), function(i) {
+  if(smoothers_test[[i]](depth_range[1]) + krige_values_test[i]<= threshold_val) return(depth_range[1])
+  if(smoothers_test[[i]](depth_range[2]) + krige_values_test[i] > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers_test[[i]](t) + krige_values_test[i] - threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy > data$logWellDepth))
+```
+
+```{r}
+Metrics::accuracy(log(data_test$concentration_plus_median) > threshold_val, indirect_policy_test > data_test$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data_test$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_test > data_test$logWellDepth))
+```
+
+##### indirect method by IPW
+
+
+We first set the bandwidth
+
+```{r}
+kernel_bw <- 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5)
+```
+
+```{r}
+gps_est <- dnorm(data$logWellDepth, mean = gps_mean_model$SL.predict, sd = gps_sigma)
+```
+
+
+We try different weights, but in general it does not work
+
+###### Independence energy weights
+
+```{r}
+indirect_policy_ipw <- sapply(1:nrow(data), function(i) {
+  # if lower bound can alreay be lower than the threshold (satisfy the ES), we have to use lower bound
+  if(data$logconcentration_plus_median[i] * gaussian_kernel(depth_range[1], data$logWellDepth[i], sigma = 5* kernel_bw) * weights$weights[i] <= threshold_val) return(depth_range[1])
+  # if even upper bound can not be lower than the threshold, we have to use upper bound
+  if(data$logconcentration_plus_median[i] * gaussian_kernel(depth_range[2], data$logWellDepth[i], sigma = 5* kernel_bw) * weights$weights[i] > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {data$logconcentration_plus_median[i] * gaussian_kernel(t, data$logWellDepth[i], sigma = 5*  kernel_bw) * weights$weights[i] - threshold_val},
+         lower = depth_range[1],
+         upper = depth_range[2])
+  return(res$root)
+})
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy_ipw > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_ipw > data$logWellDepth))
+```
+
+almost all of them goes to the lower boundary
+
+```{r}
+mean(indirect_policy_ipw == depth_range[1])
+```
+
+###### gaussian propensity weights
+
+```{r}
+indirect_policy_ipw <- sapply(1:nrow(data), function(i) {
+  # if lower bound can alreay be lower than the threshold (satisfy the ES), we have to use lower bound
+  if(data$logconcentration_plus_median[i] * gaussian_kernel(depth_range[1], data$logWellDepth[i], sigma = 5* kernel_bw)/gps_est[i] <= threshold_val) return(depth_range[1])
+  # if even upper bound can not be lower than the threshold, we have to use upper bound
+  if(data$logconcentration_plus_median[i] * gaussian_kernel(depth_range[2], data$logWellDepth[i], sigma = 5* kernel_bw)/gps_est[i] > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {data$logconcentration_plus_median[i] * gaussian_kernel(t, data$logWellDepth[i], sigma = 5*  kernel_bw)/gps_est[i] - threshold_val},
+         lower = depth_range[1],
+         upper = depth_range[2])
+  return(res$root)
+})
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy_ipw > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_ipw > data$logWellDepth))
+```
+
+almost all of them goes to the lower boundary
+
+```{r}
+mean(indirect_policy_ipw == depth_range[1])
+```
+
+###### covariate balancing weights
+
+```{r}
+indirect_policy_ipw <- sapply(1:nrow(data), function(i) {
+  # if lower bound can alreay be lower than the threshold (satisfy the ES), we have to use lower bound
+  if(data$logconcentration_plus_median[i] * gaussian_kernel(depth_range[1], data$logWellDepth[i], sigma = 5* kernel_bw) * weights_cbps$weights[i] <= threshold_val) return(depth_range[1])
+  # if even upper bound can not be lower than the threshold, we have to use upper bound
+  if(data$logconcentration_plus_median[i] * gaussian_kernel(depth_range[2], data$logWellDepth[i], sigma = 5* kernel_bw) * weights_cbps$weights[i] > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {data$logconcentration_plus_median[i] * gaussian_kernel(t, data$logWellDepth[i], sigma = 5*  kernel_bw)* weights_cbps$weights[i] - threshold_val},
+         lower = depth_range[1],
+         upper = depth_range[2])
+  return(res$root)
+})
+```
+
+```{r}
+i <- 1
+data$logconcentration_plus_median[i] * gaussian_kernel(depth_range[1], data$logWellDepth[i], sigma =  10*kernel_bw)/gps_est[i]
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy_ipw > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_ipw > data$logWellDepth))
+```
+
+almost all of them goes to the lower boundary
+
+```{r}
+mean(indirect_policy_ipw == depth_range[1])
+```
+
+The IPW initialization does not work.
+
+##### indirect method by DB
+
+###### indreict DB RKHS
+
+```{r}
+resids <- data$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+scaled_resids <- resids * weights_cbps$weights
+plot(scaled_resids)
+kernel_bw <- 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5)
+```
+
+```{r}
+indirect_policy_DB <- sapply(1:nrow(data), function(i) {
+  # if lower bound can alreay be lower than the threshold (satisfy the ES), we have to use lower bound
+  if(smoothers_RKHS[[i]](depth_range[1]) + krige_values_RKHS[i] + scaled_resids[i] * gaussian_kernel(depth_range[1], data$logWellDepth[i], sigma = kernel_bw) <= threshold_val) return(depth_range[1])
+  # if even upper bound can not be lower than the threshold, we have to use upper bound
+  if(smoothers_RKHS[[i]](depth_range[2]) + krige_values_RKHS[i] + scaled_resids[i] * gaussian_kernel(depth_range[2], data$logWellDepth[i], sigma = kernel_bw)> threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers_RKHS[[i]](t) + krige_values_RKHS[i] + scaled_resids[i] * gaussian_kernel(t, data$logWellDepth[i], sigma = kernel_bw)- threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+When I isotonic the RKHS, the improvement from DB indirect than the indirect suddenly becomes larger in training data.
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy_DB> data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_DB > data$logWellDepth))
+```
+
+compared to the 0.85/0.56 (acc, mcc) in training data of indirect method, this is much better, however, technically, we are not able to get test indirect method in test data because we don't know that obs in test data
+
+```{r}
+hist(indirect_policy_RKHS)
+mean(indirect_policy_RKHS == depth_range[1])
+```
+
+
+```{r}
+hist(indirect_policy_DB)
+mean(indirect_policy_DB == depth_range[1])
+```
+
+
+###### indirect DB XGBoost
+
+#### Direct Method: RKHS SVM
+
+```{r}
+design_matrix[, "logWellDepth"] <- (design_matrix[, "logWellDepth"] - mean_logWellDepth)/sd_logWellDepth
+design_matrix[, "precipitation"] <- (design_matrix[, "precipitation"] - mean_precipitation)/sd_precipitation
+design_matrix[, "cafolog"] <- (design_matrix[, "cafolog"] - mean_cafolog)/sd_cafolog
+design_matrix[, "StaticLevel"] <- (design_matrix[, "StaticLevel"] - mean_StaticLevel)/sd_StaticLevel
+# standardize for test data
+design_matrix_test[, "logWellDepth"] <- (design_matrix_test[, "logWellDepth"] - mean_logWellDepth)/sd_logWellDepth
+design_matrix_test[, "precipitation"] <- (design_matrix_test[, "precipitation"] - mean_precipitation)/sd_precipitation
+design_matrix_test[, "cafolog"] <- (design_matrix_test[, "cafolog"] - mean_cafolog)/sd_cafolog
+design_matrix_test[, "StaticLevel"] <- (design_matrix_test[, "StaticLevel"] - mean_StaticLevel)/sd_StaticLevel
+```
+
+#### Direct Method: RKHS SVM coordinates
+
+###### build grand matrix 
+
+```{r}
+coords_matrix <- model.matrix(~ . , data = data[, c("longitude", "latitude")])[,-1]
+coords_matrix_test <- model.matrix(~ . , data = data_test[, c("longitude", "latitude")])[,-1]
+
+train_means <- colMeans(coords_matrix)
+train_sds <- apply(coords_matrix, 2, sd)
+
+coords_matrix <- scale(coords_matrix)
+coords_matrix_test <- scale(coords_matrix_test, center = train_means, scale = train_sds)
+```
+
+```{r}
+m <- 0
+gamma <- 2^(m) * median(rdist(coords_matrix))
+rbf <- rbfdot(sigma = 1/(gamma^2))
+
+k_coords_matrix <- kernelMatrix(rbf, coords_matrix)
+# build kernel matrix for test data
+k_coords_matrix_test <- kernelMatrix(rbf, coords_matrix_test, coords_matrix)
+```
+
+```{r}
+hist(-log(k_coords_matrix[col(k_coords_matrix)!=row(k_coords_matrix)]))
+abline(v = 1,col='blue')
+
+hist(k_coords_matrix[col(k_coords_matrix)!=row(k_coords_matrix)],xlim = c(0,1))
+abline(v = exp(-1),col='blue')
+```
+
+When using coordinate as covariance, it is either many zeros or many ones in the grand matrix
+
+```{r}
+# check rank
+qr(k_coords_matrix)$rank # this is very slow, takes a very long time to run
+# when m = 0.3, the rank is 276
+dim(k_coords_matrix)
+```
+
+###### add intercept
+
+```{r}
+k_coords_matrix <- cbind(rep(1,nrow(k_coords_matrix)), k_coords_matrix)
+k_coords_matrix_test <- cbind(rep(1,nrow(k_coords_matrix_test)), k_coords_matrix_test)
+```
+
+###### initialize: stretch indirect_policy
+
+Let's see how many of indirect_policy are in the boundary
+
+```{r}
+depth_range
+mean(indirect_policy == depth_range[1])
+mean(indirect_policy == depth_range[2])
+mean(indirect_policy_test == depth_range[1])
+mean(indirect_policy_test == depth_range[2])
+```
+
+Let' see the histogram of indirect_policy
+
+```{r}
+hist(indirect_policy)
+hist(data$logconcentration_plus_median)
+abline(v = threshold_val,col='blue')
+hist(indirect_policy_test)
+hist(data_test$logconcentration_plus_median)
+abline(v = threshold_val,col='blue')
+```
+
+As mentioned in the Chan's MRTP, since the indirect method is bounded in the depth range, it may not be suitable approximation of the SVM solution before the winsorization. Using indirect_policy may lead to an estimate policy shrinking to a certain alue, i.e., policy does not reflect the heterogeneity induced by covariate X.
+Thus, we need to stretch the in_direct policy outside the boundary
+
+```{r}
+indices_non_depth_boundary <- (indirect_policy!= depth_range[1]) & (indirect_policy!= depth_range[2])
+
+depth_knots <- seq(depth_range[1], depth_range[2], length.out = 10)
+
+phi_lst <- vector("list", length(depth_knots) + 1)
+stretch_models <- vector("list", length(depth_knots) + 1)
+
+for(i in 1:length(depth_knots)){
+  depth <- depth_knots[i]
+  # fine the fitted value at that depth
+  phi_lst[[i]] <- sapply(1:nrow(data), function(indice){smoothers[[indice]](depth)})
+  # only use non-boundary value to fit linear model
+  stretch_models[[i]] <- lm(phi_lst[[i]][indices_non_depth_boundary] ~ indirect_policy[indices_non_depth_boundary])
+}
+gps_est <- dnorm(data$logWellDepth, mean = gps_mean_model$SL.predict, sd = gps_sigma)
+
+phi_lst[[length(depth_knots) + 1]] <- (data$logconcentration_plus_median - sapply(1:nrow(data), function(indice){smoothers[[indice]](data$logWellDepth[indice])}))/gps_est
+
+stretch_models[[length(depth_knots) + 1]] <- lm(phi_lst[[length(depth_knots) + 1]][indices_non_depth_boundary] ~ indirect_policy[indices_non_depth_boundary])
+```
+
+Then, we calculate the stretch value of the policy at the boundary
+
+```{r}
+indirect_policy_stretch_lst <- vector("list", length(depth_knots) + 1)
+
+for(i in 1:(length(depth_knots) + 1)){
+  intercept <- coef(stretch_models[[i]])[1]
+  slope <- coef(stretch_models[[i]])[2]
+  indirect_policy_stretch_lst[[i]] <- (phi_lst[[i]] - intercept)/slope
+}
+
+indirect_policy_stretch_lst_min <- do.call(pmin, indirect_policy_stretch_lst)
+indirect_policy_stretch_lst_max <- do.call(pmax, indirect_policy_stretch_lst)
+```
+
+```{r}
+indices_depth_lower_boundary <- indirect_policy == depth_range[1]
+indices_depth_upper_boundary <- indirect_policy == depth_range[2]
+```
+
+```{r}
+indirect_policy_stretch <- indirect_policy
+indirect_policy_stretch[indices_depth_lower_boundary] <- indirect_policy_stretch_lst_min[indices_depth_lower_boundary]
+indirect_policy_stretch[indices_depth_upper_boundary] <- indirect_policy_stretch_lst_max[indices_depth_upper_boundary]
+```
+
+```{r}
+plot(indirect_policy, indirect_policy_stretch)
+plot(1:nrow(data), indirect_policy_stretch)
+summary(indirect_policy_stretch)
+indirect_policy_stretch <- pmax(-10, indirect_policy_stretch)
+hist(indirect_policy_stretch)
+```
+
+Let's check the accuracy and mcc for the stretched policy. We found that the stretched policy even improve the performance a little bit.
+
+Also, reverse true/false does not affect the acc/mcc that much, if there is no indirect_policy == data$logWellDepth, I think the result should be the same.
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy > data$logWellDepth))
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) < threshold_val, indirect_policy < data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) < threshold_val), estimate = as.factor( indirect_policy < data$logWellDepth))
+```
+
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy_stretch > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_stretch > data$logWellDepth))
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) < threshold_val, indirect_policy_stretch < data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) < threshold_val), estimate = as.factor( indirect_policy_stretch < data$logWellDepth))
+```
+
+
+Then, we find the initial value of the DC algorithm
+
+Tune the bandwidth is important, exp(-1), median bandwidth might not work
+
+Try to get the param_initial
+
+$$\min\|alpha\|_2^2 s.t. K\alpha = \theta +\epsilon$$. \epsilon is a relexation. K omits the intercept. only use it to find the non-intercept coefficient. Using optiSolve.
+
+Two way: (1) tune hyper-parameter using cross-validation (2) do not tune hyper-parameter, find a good initial value
+
+What we want is simplest alpha that satisfy the initial. 
+
+-log() of off -diagnol grand matrix entries should be central around 1. Sanity check of RKHS. off-diagnal too small, over-fitted.
+The problem is in the initial point. 
+
+
+###### initialze: generalized inverse
+
+Use indirect policy
+
+```{r}
+params_coords_initial_ginv <- rep(0, ncol(k_coords_matrix))
+params_coords_initial_ginv[1] <- mean(indirect_policy)
+# generalized inverse rather than inverse, this is extremely slow 
+params_coords_initial_ginv[2:ncol(k_coords_matrix)] <- MASS::ginv(k_coords_matrix[,-1]) %*% (indirect_policy - mean(indirect_policy))
+```
+
+```{r}
+plot(indirect_policy, as.vector(k_coords_matrix %*% params_coords_initial_ginv), main = "initialize: ginv v.s. indirect")
+Metrics::rmse(indirect_policy, as.vector(k_coords_matrix %*% params_coords_initial_ginv))
+summary(indirect_policy - as.vector(k_coords_matrix %*%params_coords_initial_ginv))
+summary(indirect_policy)
+hist(params_coords_initial_ginv, main = "histogram of ginv initialize")
+```
+
+Let's check the acc and mcc of the initialized parameter. Why they decreased so much.
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, as.vector(k_coords_matrix %*%params_coords_initial_ginv) > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( as.vector(k_coords_matrix %*%params_coords_initial_ginv) > data$logWellDepth))
+```
+
+Use indirect policy stretch
+
+```{r}
+params_coords_initial_stretch_ginv <- rep(0, ncol(k_coords_matrix))
+params_coords_initial_stretch_ginv[1] <- mean(indirect_policy_stretch)
+# generalized inverse rather than inverse, this is extremely slow 
+params_coords_initial_stretch_ginv[2:ncol(k_coords_matrix)] <- MASS::ginv(k_coords_matrix[,-1]) %*% (indirect_policy_stretch - mean(indirect_policy_stretch))
+```
+
+```{r}
+plot(indirect_policy_stretch, as.vector(k_coords_matrix %*% params_coords_initial_stretch_ginv), main = "initialize: ginv v.s. indirect")
+Metrics::rmse(indirect_policy_stretch, as.vector(k_coords_matrix %*% params_coords_initial_stretch_ginv))
+summary(indirect_policy_stretch - as.vector(k_coords_matrix %*%params_coords_initial_stretch_ginv))
+summary(indirect_policy_stretch)
+hist(params_coords_initial_stretch_ginv, main = "histogram of ginv initialize")
+## check accurary and mcc for the initial point
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, as.vector(k_coords_matrix %*% params_coords_initial_stretch_ginv) > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( as.vector(k_coords_matrix %*% params_coords_initial_stretch_ginv > data$logWellDepth)))
+```
+
+
+###### initialze: cv glmnet
+
+```{r}
+
+cv.glmnet(x = k_coords_matrix[,-1], y = indirect_policy)
+params_coords_initial_cvglmet <- 
+params_coords_initial_ginv[1] <- mean(indirect_policy)
+# generalized inverse rather than inverse, this is extremely slow 
+params_coords_initial_ginv[2:ncol(k_coords_matrix)] <- MASS::ginv(k_coords_matrix[,-1]) %*% (indirect_policy - mean(indirect_policy))
+```
+
+```{r}
+plot(indirect_policy, as.vector(k_coords_matrix %*% params_coords_initial_ginv), main = "initialize: ginv v.s. indirect")
+Metrics::rmse(indirect_policy, as.vector(k_coords_matrix %*% params_coords_initial_ginv))
+summary(indirect_policy - as.vector(k_coords_matrix %*%params_coords_initial_ginv))
+summary(indirect_policy)
+hist(params_coords_initial_ginv, main = "histogram of ginv initialize")
+```
+
+###### initialze: glmnet 
+
+```{r}
+params_coords_initial_ginv <- rep(0, ncol(k_coords_matrix))
+params_coords_initial_ginv[1] <- mean(indirect_policy)
+# generalized inverse rather than inverse, this is extremely slow 
+params_coords_initial_ginv[2:ncol(k_coords_matrix)] <- MASS::ginv(k_coords_matrix[,-1]) %*% (indirect_policy - mean(indirect_policy))
+```
+
+```{r}
+plot(indirect_policy, as.vector(k_coords_matrix %*% params_coords_initial_ginv), main = "initialize: ginv v.s. indirect")
+Metrics::rmse(indirect_policy, as.vector(k_coords_matrix %*% params_coords_initial_ginv))
+summary(indirect_policy - as.vector(k_coords_matrix %*%params_coords_initial_ginv))
+summary(indirect_policy)
+hist(params_coords_initial_ginv, main = "histogram of ginv initialize")
+```
+
+##### DC algorithm
+
+```{r}
+max_iter <- 50
+tol <- 1e-4
+clip_epsilon_bar <- 300
+clip_epsilon <- 1
+kernel_bw <- 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5)
+depth_range <- c(min(data$logWellDepth), max(data$logWellDepth))
+
+surrogate_type <- "Gaussian"
+
+loss_type <- "ipw"
+resids <- data$logconcentration_plus_median
+krige_adjust <- rep(0, nrow(data))
+
+# loss_type <- 'or'
+# resids <- data$Y - outcome_mean_nonsp_model$SL.predict
+# krige_adjust <- krige_values
+
+# loss_type <- 'db'
+# resids <- data$Y - outcome_mean_nonsp_model$SL.predict
+# krige_adjust <- krige_values
+
+
+gps_est <- dnorm(data$logWellDepth, mean = gps_mean_model$SL.predict, sd = gps_sigma)
+
+params_old <- params_coords_initial
+params <- params_coords_initial
+
+for (k in 1:max_iter) {
+    
+    # Solve the convex subproblem
+    cat(k,'-th iteration of DC algorithm','\n')
+    sub_result <- optim(par = params_old, 
+                        fn = compute_total_loss_smooth_dc_approx, 
+                        gr = d_compute_total_loss_smooth_dc_approx, # we try the case with/without gr
+                        params_old = params_old, 
+                        K = k_coords_matrix, 
+                        T = data$logWellDepth,
+                        krige_adjust = krige_adjust,
+                        outcome_resid = resids,
+                        propensity_est = pmax(gps_est,0.001),
+                        lambda = 0, 
+                        smoothers = smoothers, 
+                        cumint_smoothers = cumint_smoothers, 
+                        kernel_bw = kernel_bw, 
+                        trt_bounds = depth_range,
+                        threshold_val = threshold_val, 
+                        clip_epsilon = clip_epsilon,
+                        clip_epsilon_bar = clip_epsilon_bar,
+                        surrogate_type = surrogate_type,
+                        loss_type = loss_type,
+                        method = "L-BFGS-B", 
+                        control = list(maxit = 60, trace = 3))
+    
+    params <- sub_result$par
+    
+    # 3. Check for convergence
+    change <- sqrt(sum((params_old - params)^2))
+    cat(sprintf("Iter: %d, Change: %f, Objective: %f\n", k, change, sub_result$value))
+    
+    if (change < tol) {
+      cat("--- DC Algorithm Converged ---\n")
+      params_old <- params
+      break
+    }
+    
+    params_old <- params
+  }
+```
+
+```{r}
+plot(params_coords_initial, params_old)
+```
+
+
+```{r}
+print('training')
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, as.vector(k_coords_matrix %*% params_old)  > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor(as.vector(k_coords_matrix %*% params_old)  > data$logWellDepth))
+
+print('test')
+Metrics::accuracy(log(data_test$concentration_plus_median) > threshold_val, as.numeric(k_coords_matrix_test%*% params_old  > data_test$logWellDepth))
+yardstick::mcc_vec(truth = as.factor(log(data_test$concentration_plus_median) > threshold_val), estimate = as.factor(as.vector(k_coords_matrix_test %*% params_old  > data_test$logWellDepth)))
+```
+
+Let's try non-DC, direct optimization algorithm
+
+compute_total_loss_smooth <- function(assigned_trt,
+                                         subject_idx,
+                                         T,
+                                         krige_adjust,
+                                         outcome_resid,
+                                         propensity_est,
+                                         cumint_smoothers,
+                                         trt_bounds,
+                                         threshold_val,
+                                         kernel_bw,
+                                         clip_epsilon,
+                                         surrogate_type = c("Gaussian", "Box"),
+                                         loss_type = c("db","ipw","or"))
+
+```{r}
+optim(par = params_old, 
+      fn = compute_total_loss_smooth, 
+      gr = d_compute_total_loss_db_smooth, # we try the case with/without gr
+      params_old = params_old, 
+      K = k_coords_matrix, 
+      T = data$logWellDepth,
+      krige_adjust = krige_adjust,
+      outcome_resid = resids,
+      propensity_est = pmax(gps_est,0.001),
+      lambda = 0, 
+      smoothers = smoothers, 
+      cumint_smoothers = cumint_smoothers, 
+      kernel_bw = kernel_bw, 
+      trt_bounds = depth_range,
+      threshold_val = threshold_val, 
+      clip_epsilon = clip_epsilon,
+      clip_epsilon_bar = clip_epsilon_bar,
+      surrogate_type = surrogate_type,
+      loss_type = loss_type,
+      method = "L-BFGS-B", 
+      control = list(maxit = 60, trace = 3))
+```
+
+
+#### Direct Method: RKHS SVM covariate
+
+##### preparation and initialize: for covariate
+
+###### build grand matrix 
+
+```{r}
+# kernel_design_matrix <- model.matrix(~ . , data = data[, GPS_covariate_names])[,-1]
+# kernel_design_matrix_test <- model.matrix(~ . , data = data_test[, GPS_covariate_names])[,-1]
+# 
+# kernel_design_matrix <- model.matrix(~ . , data = cbind(data[, GPS_covariate_names], data[, c("longitude", "latitude")]))[,-1]
+# kernel_design_matrix_test <- model.matrix(~ . , data = cbind(data_test[, GPS_covariate_names], data_test[, c("longitude", "latitude")]))[,-1]
+
+# we use the following one for now
+kernel_design_matrix <- model.matrix(~ . , data = cbind(data[, GPS_covariate_names], U = krige_values_RKHS))[,-1]
+kernel_design_matrix_test <- model.matrix(~ . , data = cbind(data_test[, GPS_covariate_names], U = krige_values_test_RKHS))[,-1]
+```
+
+```{r}
+train_means <- colMeans(kernel_design_matrix)
+train_sds <- apply(kernel_design_matrix, 2, sd)
+
+kernel_design_matrix <- scale(kernel_design_matrix)
+kernel_design_matrix_test <- scale(kernel_design_matrix_test, center = train_means, scale = train_sds)
+```
+
+```{r}
+# we need to scale the continuous variables
+# mean_logWellDepth <- mean(design_matrix[, "logWellDepth"])
+# sd_logWellDepth <- sd(design_matrix[, "logWellDepth"])
+
+mean_precipitation <- mean(kernel_design_matrix[, "precipitation"])
+sd_precipitation <- sd(kernel_design_matrix[, "precipitation"])
+
+mean_cafolog <- mean(kernel_design_matrix[, "cafolog"])
+sd_cafolog <- sd(kernel_design_matrix[, "cafolog"])
+
+mean_StaticLevel <- mean(kernel_design_matrix[, "StaticLevel"])
+sd_StaticLevel <- sd(kernel_design_matrix[, "StaticLevel"])
+```
+
+```{r}
+kernel_design_matrix[, "precipitation"] <- (kernel_design_matrix[, "precipitation"] - mean_precipitation)/sd_precipitation
+kernel_design_matrix[, "cafolog"] <- (kernel_design_matrix[, "cafolog"] - mean_cafolog)/sd_cafolog
+kernel_design_matrix[, "StaticLevel"] <- (kernel_design_matrix[, "StaticLevel"] - mean_StaticLevel)/sd_StaticLevel
+# standardize for test data
+kernel_design_matrix_test[, "precipitation"] <- (kernel_design_matrix_test[, "precipitation"] - mean_precipitation)/sd_precipitation
+kernel_design_matrix_test[, "cafolog"] <- (kernel_design_matrix_test[, "cafolog"] - mean_cafolog)/sd_cafolog
+kernel_design_matrix_test[, "StaticLevel"] <- (kernel_design_matrix_test[, "StaticLevel"] - mean_StaticLevel)/sd_StaticLevel
+```
+
+```{r}
+m <- 0
+gamma <- 2^(m) * median(rdist(kernel_design_matrix))
+rbf <- rbfdot(sigma = 1/(gamma^2))
+
+k_matrix <- kernelMatrix(rbf, kernel_design_matrix)
+# build kernel matrix for test data
+k_matrix_test <- kernelMatrix(rbf, kernel_design_matrix_test, kernel_design_matrix)
+```
+
+```{r}
+hist(-log(k_matrix[col(k_matrix)!=row(k_matrix)]))
+abline(v = 1,col='blue')
+
+hist(k_matrix[col(k_matrix)!=row(k_matrix)],xlim = c(0,1))
+abline(v = exp(-1),col='blue')
+```
+
+This is like the least square loss
+
+```{r}
+svm_policy <- svm(x = kernel_design_matrix, y = indirect_policy_DB)
+```
+
+training metrics
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, predict(svm_policy, kernel_design_matrix)  > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor(predict(svm_policy, kernel_design_matrix)  > data$logWellDepth))
+```
+
+test metrics
+
+```{r}
+Metrics::accuracy(log(data_test$concentration_plus_median) > threshold_val, predict(svm_policy, kernel_design_matrix_test)  > data_test$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data_test$concentration_plus_median) > threshold_val), estimate = as.factor(predict(svm_policy, kernel_design_matrix_test)  > data_test$logWellDepth))
+```
+
+It seems not too bad?
+
+###### add intercept
+
+```{r}
+k_matrix <- cbind(rep(1,nrow(k_matrix)), k_matrix)
+k_matrix_test <- cbind(rep(1,nrow(k_matrix_test)), k_matrix_test)
+```
+
+###### initialize: stretch indirect_policy
+
+As mentioned in the Chan's MRTP, since the indirect method is bounded in the depth range, it may not be suitable approximation of the SVM solution before the winsorization. Using indirect_policy may lead to an estimate policy shrinking to a certain alue, i.e., policy does not reflect the heterogeneity induced by covariate X.
+Thus, we need to stretch the in_direct policy outside the boundary
+
+```{r}
+indices_non_depth_boundary <- (indirect_policy_DB!= depth_range[1]) & (indirect_policy_DB!= depth_range[2])
+
+depth_knots <- seq(depth_range[1], depth_range[2], length.out = 10)
+
+phi_lst <- vector("list", length(depth_knots) + 1)
+stretch_models <- vector("list", length(depth_knots) + 1)
+
+for(i in 1:length(depth_knots)){
+  depth <- depth_knots[i]
+  # fine the fitted value at that depth
+  phi_lst[[i]] <- sapply(1:nrow(data), function(indice){smoothers_RKHS[[indice]](depth) + krige_values_RKHS[indice]})
+  # only use non-boundary value to fit linear model
+  stretch_models[[i]] <- lm(phi_lst[[i]][indices_non_depth_boundary] ~ indirect_policy_DB[indices_non_depth_boundary])
+}
+
+gps_est <- dnorm(data$logWellDepth, mean = gps_mean_model$SL.predict, sd = gps_sigma)
+
+phi_lst[[length(depth_knots) + 1]] <- (data$logconcentration_plus_median - sapply(1:nrow(data), function(indice){smoothers_RKHS[[indice]](data$logWellDepth[indice]) - krige_values_RKHS[indice]}))/gps_est
+
+stretch_models[[length(depth_knots) + 1]] <- lm(phi_lst[[length(depth_knots) + 1]][indices_non_depth_boundary] ~ indirect_policy_DB[indices_non_depth_boundary])
+```
+
+Then, we calculate the stretch value of the policy at the boundary
+
+```{r}
+indirect_policy_DB_stretch_lst <- vector("list", length(depth_knots) + 1)
+
+for(i in 1:(length(depth_knots) + 1)){
+  intercept <- coef(stretch_models[[i]])[1]
+  slope <- coef(stretch_models[[i]])[2]
+  indirect_policy_DB_stretch_lst[[i]] <- (phi_lst[[i]] - intercept)/slope
+}
+
+indirect_policy_DB_stretch_lst_min <- do.call(pmin, indirect_policy_DB_stretch_lst)
+indirect_policy_DB_stretch_lst_max <- do.call(pmax, indirect_policy_DB_stretch_lst)
+```
+
+```{r}
+indices_depth_lower_boundary <- indirect_policy_DB == depth_range[1]
+indices_depth_upper_boundary <- indirect_policy_DB == depth_range[2]
+```
+
+```{r}
+indirect_policy_DB_stretch <- indirect_policy_DB
+indirect_policy_DB_stretch[indices_depth_lower_boundary] <- indirect_policy_DB_stretch_lst_min[indices_depth_lower_boundary]
+indirect_policy_DB_stretch[indices_depth_upper_boundary] <- indirect_policy_DB_stretch_lst_max[indices_depth_upper_boundary]
+```
+
+```{r}
+plot(indirect_policy_DB, indirect_policy_DB_stretch)
+plot(1:nrow(data), indirect_policy_DB_stretch)
+summary(indirect_policy_DB_stretch)
+
+indirect_policy_DB_stretch <- pmax(-20, indirect_policy_DB_stretch)
+hist(indirect_policy_DB_stretch)
+```
+
+Let's check the accuracy and mcc for the stretched policy. We found that the stretched policy even improve the performance a little bit.
+
+Also, reverse true/false does not affect the acc/mcc that much, if there is no indirect_policy == data$logWellDepth, I think the result should be the same.
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, indirect_policy_DB > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( indirect_policy_DB > data$logWellDepth))
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) < threshold_val, indirect_policy_DB_stretch < data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) < threshold_val), estimate = as.factor( indirect_policy_DB_stretch < data$logWellDepth))
+```
+
+
+
+###### initialze: generalized inverse
+
+Use indirect policy
+
+```{r}
+params_coords_initial_ginv <- rep(0, ncol(k_matrix))
+params_coords_initial_ginv[1] <- mean(indirect_policy)
+# generalized inverse rather than inverse, this is extremely slow 
+params_coords_initial_ginv[2:ncol(k_coords_matrix)] <- MASS::ginv(k_coords_matrix[,-1]) %*% (indirect_policy - mean(indirect_policy))
+```
+
+```{r}
+plot(indirect_policy, as.vector(k_coords_matrix %*% params_coords_initial_ginv), main = "initialize: ginv v.s. indirect")
+Metrics::rmse(indirect_policy, as.vector(k_coords_matrix %*% params_coords_initial_ginv))
+summary(indirect_policy - as.vector(k_coords_matrix %*%params_coords_initial_ginv))
+summary(indirect_policy)
+hist(params_coords_initial_ginv, main = "histogram of ginv initialize")
+```
+
+Let's check the acc and mcc of the initialized parameter. Why they decreased so much.
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, as.vector(k_coords_matrix %*%params_coords_initial_ginv) > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( as.vector(k_coords_matrix %*%params_coords_initial_ginv) > data$logWellDepth))
+```
+
+Use indirect policy stretch
+
+```{r}
+params_coords_initial_stretch_ginv <- rep(0, ncol(k_coords_matrix))
+params_coords_initial_stretch_ginv[1] <- mean(indirect_policy_stretch)
+# generalized inverse rather than inverse, this is extremely slow 
+params_coords_initial_stretch_ginv[2:ncol(k_coords_matrix)] <- MASS::ginv(k_coords_matrix[,-1]) %*% (indirect_policy_stretch - mean(indirect_policy_stretch))
+```
+
+```{r}
+plot(indirect_policy_stretch, as.vector(k_coords_matrix %*% params_coords_initial_stretch_ginv), main = "initialize: ginv v.s. indirect")
+Metrics::rmse(indirect_policy_stretch, as.vector(k_coords_matrix %*% params_coords_initial_stretch_ginv))
+summary(indirect_policy_stretch - as.vector(k_coords_matrix %*%params_coords_initial_stretch_ginv))
+summary(indirect_policy_stretch)
+hist(params_coords_initial_stretch_ginv, main = "histogram of ginv initialize")
+## check accurary and mcc for the initial point
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, as.vector(k_coords_matrix %*% params_coords_initial_stretch_ginv) > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor( as.vector(k_coords_matrix %*% params_coords_initial_stretch_ginv > data$logWellDepth)))
+```
+
+
+###### initialze: cv glmnet
+
+```{r}
+initial_cvglmnet <- cv.glmnet(x = k_matrix[,-1], y = indirect_policy_DB, alpha = 0)
+params_initial_cvglmet <- coef(initial_cvglmnet)
+params_initial_cvglmet <- as.numeric(params_initial_cvglmet)
+```
+
+```{r}
+plot(indirect_policy_DB, as.vector(k_matrix %*% params_initial_cvglmet), main = "initialize: indirect v.s. indirect DB")
+Metrics::rmse(indirect_policy_DB, as.vector(k_matrix %*% params_initial_cvglmet))
+summary(indirect_policy_DB - as.vector(k_matrix %*% params_initial_cvglmet))
+summary(indirect_policy_DB)
+hist(params_initial_cvglmet, main = "histogram of cvglmnet initialize")
+```
+
+###### initialze: glmnet 
+
+```{r}
+# the original indirect policy
+initial_glmnet <- glmnet(x = k_matrix[,-1], y = indirect_policy_DB, alpha = 0, lambda = 0)
+params_initial_glmnet <- coef(initial_glmnet)
+params_initial_glmnet <- as.numeric(params_initial_glmnet)
+
+# # or the stretched indirect policy
+# initial_glmnet <- glmnet(x = k_matrix[,-1], y = indirect_policy_DB_stretch, alpha = 0, lambda = 0)
+# params_initial_glmnet <- coef(initial_glmnet)
+# params_initial_glmnet <- as.numeric(params_initial_glmnet)
+# 
+# # it seems like the stretch actually does not help
+```
+
+```{r}
+plot(indirect_policy_DB, as.vector(k_matrix %*% params_initial_glmnet), main = "initialize: indirect v.s. indirect DB")
+Metrics::rmse(indirect_policy_DB, as.vector(k_matrix %*% params_initial_glmnet))
+summary(indirect_policy_DB - as.vector(k_matrix %*% params_initial_glmnet))
+summary(indirect_policy_DB)
+hist(params_initial_glmnet, main = "histogram of cvglmnet initialize")
+```
+
+
+result of cv.glmnet initial
+
+```{r}
+print('training')
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, as.vector(k_matrix %*% params_initial_glmnet)  > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor(as.vector(k_matrix %*% params_initial_glmnet)  > data$logWellDepth))
+
+print('test')
+Metrics::accuracy(log(data_test$concentration_plus_median) > threshold_val, as.numeric(k_matrix_test%*% params_initial_glmnet  > data_test$logWellDepth))
+yardstick::mcc_vec(truth = as.factor(log(data_test$concentration_plus_median) > threshold_val), estimate = as.factor(as.vector(k_matrix_test %*% params_initial_glmnet  > data_test$logWellDepth)))
+```
+
+```{r}
+print('training')
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, as.vector(k_matrix %*% params_initial_cvglmet)  > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor(as.vector(k_matrix %*% params_initial_cvglmet)  > data$logWellDepth))
+
+print('test')
+Metrics::accuracy(log(data_test$concentration_plus_median) > threshold_val, as.numeric(k_matrix_test%*% params_initial_cvglmet  > data_test$logWellDepth))
+yardstick::mcc_vec(truth = as.factor(log(data_test$concentration_plus_median) > threshold_val), estimate = as.factor(as.vector(k_matrix_test %*% params_initial_cvglmet  > data_test$logWellDepth)))
+```
+
+##### dc algorithm
+
+```{r}
+max_iter <- 50
+tol <- 1e-4
+clip_epsilon_bar <- 300
+clip_epsilon <- 1
+kernel_bw <- 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5)
+depth_range <- c(min(data$logWellDepth), max(data$logWellDepth))
+
+surrogate_type <- "Gaussian"
+
+# loss_type <- "ipw"
+# resids <- data$logconcentration_plus_median
+# krige_adjust <- rep(0, nrow(data))
+
+# loss_type <- 'or'
+# resids <- data$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+# krige_adjust <- krige_values_RKHS
+
+loss_type <- 'db'
+resids <- data$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+krige_adjust <- krige_values_RKHS
+
+
+gps_est <- dnorm(data$logWellDepth, mean = gps_mean_model$SL.predict, sd = gps_sigma)
+
+params_old <- params_initial_glmnet
+params <- params_initial_glmnet
+
+smoothers <- smoothers_RKHS
+cumint_smoothers <- cumint_smoothers_RKHS
+threshold_val <- log(5)
+
+for (k in 1:max_iter) {
+    
+    # Solve the convex subproblem
+    cat(k,'-th iteration of DC algorithm','\n')
+    sub_result <- optim(par = params_old, 
+                        fn = compute_total_loss_smooth_dc_approx, 
+                        gr = d_compute_total_loss_smooth_dc_approx, # we try the case with/without gr
+                        params_old = params_old, 
+                        K = k_matrix, 
+                        T = data$logWellDepth,
+                        krige_adjust = krige_adjust,
+                        outcome_resid = resids,
+                        propensity_est = pmax(gps_est,0.001),
+                        lambda = 10, 
+                        smoothers = smoothers, 
+                        cumint_smoothers = cumint_smoothers, 
+                        kernel_bw = kernel_bw, 
+                        trt_bounds = depth_range,
+                        threshold_val = log(5), 
+                        clip_epsilon = clip_epsilon,
+                        clip_epsilon_bar = clip_epsilon_bar,
+                        surrogate_type = surrogate_type,
+                        loss_type = loss_type,
+                        method = "L-BFGS-B", 
+                        control = list(maxit = 60, trace = 3))
+    
+    params <- sub_result$par
+    
+    # 3. Check for convergence
+    change <- sqrt(sum((params_old - params)^2))
+    cat(sprintf("Iter: %d, Change: %f, Objective: %f\n", k, change, sub_result$value))
+    
+    if (change < tol) {
+      cat("--- DC Algorithm Converged ---\n")
+      params_old <- params
+      break
+    }
+    
+    params_old <- params
+  }
+```
+
+
+I think the IPW case just does not work
+
+```{r}
+# Some not when implement thr IPW case
+# In "IPW" case: 
+# When setting lambda = 0, At iterate     0  f=      -1.9501  |proj g|=       1.4006 when gr is defined, 
+# At X0, 0 variables are exactly at the bounds At iterate     0  f=      -1.9501  |proj g|=       1.7171 when gr is not defined
+# 
+# 
+# 
+# It returns: At iterate     0  f=      -38.499  |proj g|=       2.3897, without specifying gr.
+# But it returns At iterate     0  f=      -38.499  |proj g|=       1.3454, so there might be issue with the derivative
+```
+
+```{r}
+# I think the initial looks too crazy
+plot(params_initial_glmnet, params)
+```
+
+
+
+```{r}
+cat('RKHS loss:')
+sum(compute_total_loss_smooth(assigned_trt = k_matrix %*% params_old,
+                         subject_idx = 1:nrow(k_matrix),
+                         T = data$logWellDepth,
+                         krige_adjust = krige_adjust,
+                         outcome_resid = resids,
+                         propensity_est = gps_est,
+                         cumint_smoothers = cumint_smoothers,
+                         trt_bounds = depth_range,
+                         kernel_bw = kernel_bw, 
+                         threshold_val = threshold_val, 
+                         clip_epsilon = clip_epsilon,
+                         surrogate_type = "Gaussian",
+                         loss_type = "or"))
+cat('\n')
+cat('parametric loss:')
+sum(compute_total_loss_smooth(assigned_trt = indirect_policy_DB,
+                         subject_idx = 1:nrow(k_matrix),
+                         T = data$logWellDepth,
+                         krige_adjust = krige_adjust,
+                         outcome_resid = resids,
+                         propensity_est = gps_est,
+                         cumint_smoothers = cumint_smoothers,
+                         trt_bounds = depth_range,
+                         kernel_bw = kernel_bw, 
+                         threshold_val = threshold_val, 
+                         clip_epsilon = clip_epsilon,
+                         surrogate_type = "Gaussian",
+                         loss_type = "or"))
+cat('\n')
+```
+
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, as.vector(k_matrix %*% params_old)  > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor(as.vector(k_matrix %*% params_old > data$logWellDepth)))
+```
+
+```{r}
+Metrics::accuracy(log(data_test$concentration_plus_median) > threshold_val, as.numeric(k_matrix_test%*% params_old  > data_test$logWellDepth))
+yardstick::mcc_vec(truth = as.factor(log(data_test$concentration_plus_median) > threshold_val), estimate = as.factor(as.vector(k_matrix_test %*% params_old  > data_test$logWellDepth)))
+```
+
+
+```{r}
+plot(indirect_policy_nonsp_test,  k_matrix_test %*% params_old)
+plot(indirect_policy_nonsp,  k_matrix %*% params_old)
+```
+
+
+##### Let's use a 20 x 20 kernel to do a small test
+
+```{r}
+# we use the following one for now
+kernel_design_matrix <- model.matrix(~ . , data = cbind(data[, GPS_covariate_names], U = krige_values_RKHS))[,-1]
+kernel_design_matrix <- scale(kernel_design_matrix)
+```
+
+get different types of indirect method: OR based
+
+```{r}
+indirect_policy_RKHS <- sapply(1:nrow(data), function(i) {
+  # if lower bound can alreay be lower than the threshold (satisfy the ES), we have to use lower bound
+  if(smoothers_RKHS[[i]](depth_range[1]) + krige_values_RKHS[i] <= threshold_val) return(depth_range[1])
+  # if even upper bound can not be lower than the threshold, we have to use upper bound
+  if(smoothers_RKHS[[i]](depth_range[2]) + krige_values_RKHS[i] > threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers_RKHS[[i]](t) + krige_values_RKHS[i] - threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+get different types of indirect method: DB based
+
+```{r}
+resids <- data$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+scaled_resids <- resids * weights_cbps$weights
+# plot(scaled_resids)
+kernel_bw <- 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5)
+```
+
+```{r}
+indirect_policy_DB <- sapply(1:nrow(data), function(i) {
+  # if lower bound can alreay be lower than the threshold (satisfy the ES), we have to use lower bound
+  if(smoothers_RKHS[[i]](depth_range[1]) + krige_values_RKHS[i] + scaled_resids[i] * gaussian_kernel(depth_range[1], data$logWellDepth[i], sigma = kernel_bw) <= threshold_val) return(depth_range[1])
+  # if even upper bound can not be lower than the threshold, we have to use upper bound
+  if(smoothers_RKHS[[i]](depth_range[2]) + krige_values_RKHS[i] + scaled_resids[i] * gaussian_kernel(depth_range[2], data$logWellDepth[i], sigma = kernel_bw)> threshold_val) return(depth_range[2])
+  res <- uniroot(f = function(t) {smoothers_RKHS[[i]](t) + krige_values_RKHS[i] + scaled_resids[i] * gaussian_kernel(t, data$logWellDepth[i], sigma = kernel_bw)- threshold_val},
+        lower = depth_range[1],
+        upper = depth_range[2])
+  return(res$root)
+})
+```
+
+check that the DB and OR indirect minimize the corresponding loss function
+
+get the subset (sample size 20) for test
+
+```{r}
+set.seed(1998)
+sub_indices <- sample(nrow(kernel_design_matrix), 20)
+kernel_design_matrix_small <- kernel_design_matrix[sub_indices,]
+indirect_policy_DB_small <- indirect_policy_DB[sub_indices]
+indirect_policy_RKHS_small <- indirect_policy_RKHS[sub_indices]
+```
+
+```{r}
+m <- 0
+gamma <- 2^(m) * median(rdist(kernel_design_matrix_small))
+rbf <- rbfdot(sigma = 1/(gamma^2))
+k_matrix <- kernelMatrix(rbf, kernel_design_matrix_small)
+k_matrix <- cbind(rep(1,20), k_matrix)
+```
+
+```{r}
+hist(k_matrix)
+```
+
+
+```{r}
+initial_glmnet <- glmnet(x = k_matrix[,-1], y = indirect_policy_DB_small, alpha = 0, lambda = 0)
+params_initial_glmnet <- coef(initial_glmnet)
+params_initial_glmnet <- as.numeric(params_initial_glmnet)
+```
+
+```{r}
+plot(indirect_policy_DB_small, as.vector(k_matrix %*% params_initial_glmnet), main = "initialize: indirect v.s. indirect DB")
+Metrics::rmse(indirect_policy_DB_small, as.vector(k_matrix %*% params_initial_glmnet))
+summary(indirect_policy_DB_small - as.vector(k_matrix %*% params_initial_glmnet))
+summary(indirect_policy_DB_small)
+hist(params_initial_glmnet, main = "histogram of cvglmnet initialize")
+```
+
+```{r}
+
+direct_optim_trt <- optim(par = cbind(rep(1,20),diag(20)) %*% params_initial_glmnet,
+      fn = compute_total_loss_sum_smooth,
+      subject_idx = 1:20,
+      T = data$logWellDepth[sub_indices],
+      krige_adjust = krige_values_RKHS[sub_indices],
+      outcome_resid = rep(0,20),
+      propensity_est = rep(1,20),
+      cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+      trt_bounds = depth_range,
+      threshold_val = log(5), 
+      kernel_bw = kernel_bw, 
+      clip_epsilon = clip_epsilon,
+      surrogate_type = "Gaussian",
+      loss_type = "or",
+      method = "L-BFGS-B", 
+      control = list(maxit = 60, trace =4))
+
+```
+```{r}
+plot(indirect_policy_RKHS_small - direct_optim_trt$par)
+```
+
+```{r}
+compute_total_loss_sum_smooth(assigned_trt = direct_optim_trt$par,
+                              subject_idx = 1:20,
+                              T = data$logWellDepth[sub_indices],
+                              krige_adjust = krige_values_RKHS[sub_indices],
+                              outcome_resid = rep(0,20),
+                              propensity_est = rep(1,20),
+                              cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+                              trt_bounds = depth_range,
+                              threshold_val = log(5), 
+                              kernel_bw = kernel_bw, 
+                              clip_epsilon = clip_epsilon,
+                              surrogate_type = "Gaussian",
+                              loss_type = "or")
+```
+
+```{r}
+# for (indice in sub_indices){
+#   plot(seq(depth_range[1],depth_range[2],length.out = 200), sapply(seq(depth_range[1],depth_range[2],length.out = 200),function(t){smoothers[[indice]](t)}))
+# }
+for (i in 1:length(sub_indices)){
+  indice <- sub_indices[i]
+  plot(seq(depth_range[1],depth_range[2],length.out = 200), sapply(seq(depth_range[1],depth_range[2],length.out = 200),function(t){threshold_val*(t-depth_range[1])- cumint_smoothers[[indice]](t)}), xlim = c(0,10), ylim = c(-3,3))
+  lines(seq(depth_range[1],depth_range[2],length.out = 200), sapply(seq(depth_range[1],depth_range[2],length.out = 200),function(t){compute_total_loss_sum_smooth(assigned_trt = t,
+                              subject_idx = i,
+                              T = data$logWellDepth[sub_indices],
+                              krige_adjust = krige_values_RKHS[sub_indices],
+                              outcome_resid = rep(0,20),
+                              propensity_est = rep(1,20),
+                              cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+                              trt_bounds = depth_range,
+                              threshold_val = log(5), 
+                              kernel_bw = kernel_bw, 
+                              clip_epsilon = clip_epsilon,
+                              surrogate_type = "Gaussian",
+                              loss_type = "or")}), xlim = c(0,10),ylim = c(-3,3),col = 'grey')
+  abline(v = direct_optim_trt$par[i],col='blue')
+  abline(v = indirect_policy_RKHS_small[i],col='green')
+}
+
+```
+
+
+! Try one sample loss function optimization.
+
+```{r}
+surrogate_type <- "Gaussian"
+
+# loss_type <- "ipw"
+# resids <- data$logconcentration_plus_median
+# krige_adjust <- rep(0, nrow(data))
+
+loss_type <- 'or'
+# resids <- data$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+# krige_adjust <- krige_values_RKHS
+
+# loss_type <- 'db'
+# resids <- data$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+# krige_adjust <- krige_values_RKHS
+
+# smoothers <- smoothers_RKHS
+# cumint_smoothers <- cumint_smoothers_RKHS
+
+direct_optim <- optim(#par = params_initial_glmnet, 
+                      par =  c(mean(indirect_policy_DB_small), indirect_policy_DB_small - mean(indirect_policy_DB_small)),
+                      fn = compute_total_loss_smooth_RKHS, # when doing this, I think it fails to calculate the derivative numerically by optim
+                      gr = d_compute_total_loss_smooth_RKHS,
+                      K = cbind(rep(1,20),diag(20)), 
+                      T = data$logWellDepth[sub_indices],
+                      krige_adjust = krige_values_RKHS[sub_indices],
+                      outcome_resid = rep(0,20),
+                      propensity_est = rep(1,20),
+                      lambda = 0, 
+                      smoothers = smoothers_RKHS[sub_indices], 
+                      cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+                      kernel_bw = kernel_bw, 
+                      trt_bounds = depth_range,
+                      threshold_val = log(5), 
+                      clip_epsilon = clip_epsilon,
+                      surrogate_type = surrogate_type,
+                      loss_type = loss_type,
+                      method = "L-BFGS-B",  # Try one sample loss function optimization. 
+                      # method = "Nelder-Mead", # try non-gradient
+                      control = list(maxit = 60, trace = 5))
+```
+
+```{r}
+cauchy_x <- c(1.42474, 1.89435, -0.600596, -1.03981, -1.15887, -0.599502, 
+              -0.958252, -0.343123, -1.1015, -0.623741, -0.658636, 
+              -1.10584, 1.97502, -0.861156, 0.0160609, -0.529284, 
+              0.519484, 1.9086, -0.870035, 0.046277, 1.13534)
+```
+
+```{r}
+compute_total_loss_smooth_RKHS(params = cauchy_x,
+                                   K = cbind(rep(1,20),diag(20)), 
+                                    T = data$logWellDepth[sub_indices],
+                                    krige_adjust = krige_values_RKHS[sub_indices],
+                                    outcome_resid = rep(0,20),
+                                    propensity_est = rep(1,20),
+                                    lambda = 0, 
+                                    smoothers = smoothers_RKHS[sub_indices], 
+                                    cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(5), 
+                                    clip_epsilon = clip_epsilon,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+```
+
+Is it the problem with cumint_smoothers?
+
+```{r}
+compute_total_loss_smooth_RKHS(params = direct_optim$par,
+                                   K = cbind(rep(1,20),diag(20)), 
+                                    T = data$logWellDepth[sub_indices],
+                                    krige_adjust = krige_values_RKHS[sub_indices],
+                                    outcome_resid = rep(0,20),
+                                    propensity_est = rep(1,20),
+                                    lambda = 0, 
+                                    smoothers = smoothers_RKHS[sub_indices], 
+                                    cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(5), 
+                                    clip_epsilon = clip_epsilon,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+
+compute_total_loss_smooth_RKHS(params = c(mean(indirect_policy_DB_small), indirect_policy_DB_small - mean(indirect_policy_DB_small)),
+                                   K = cbind(rep(1,20),diag(20)), 
+                                    T = data$logWellDepth[sub_indices],
+                                    krige_adjust = krige_values_RKHS[sub_indices],
+                                    outcome_resid = rep(0,20),
+                                    propensity_est = rep(1,20),
+                                    lambda = 0, 
+                                    smoothers = smoothers_RKHS[sub_indices], 
+                                    cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(5), 
+                                    clip_epsilon = clip_epsilon,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+
+compute_total_loss_smooth_RKHS(params = c(mean(indirect_policy_RKHS_small), indirect_policy_RKHS_small - mean(indirect_policy_RKHS_small)),
+                                   K = cbind(rep(1,20),diag(20)), 
+                                    T = data$logWellDepth[sub_indices],
+                                    krige_adjust = krige_values_RKHS[sub_indices],
+                                    outcome_resid = rep(0,20),
+                                    propensity_est = rep(1,20),
+                                    lambda = 0, 
+                                    smoothers = smoothers_RKHS[sub_indices], 
+                                    cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(5), 
+                                    clip_epsilon = clip_epsilon,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+```
+
+
+```{r}
+plot(c(mean(indirect_policy_DB_small), indirect_policy_DB_small - mean(indirect_policy_DB_small)), c(mean(indirect_policy_RKHS_small), indirect_policy_RKHS_small - mean(indirect_policy_RKHS_small)))
+```
+
+
+```{r}
+max_iter <- 50
+tol <- 1e-4
+clip_epsilon_bar <- 300
+clip_epsilon <- 1
+kernel_bw <- 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5)
+depth_range <- c(min(data$logWellDepth), max(data$logWellDepth))
+
+surrogate_type <- "Gaussian"
+
+loss_type <- 'or'
+krige_adjust <- krige_values_RKHS
+
+
+params_old <- params_initial_glmnet
+params <- params_initial_glmnet
+
+smoothers <- smoothers_RKHS[sub_indices]
+cumint_smoothers <- cumint_smoothers_RKHS[sub_indices]
+threshold_val <- log(5)
+
+par_initial <- c(mean(indirect_policy_DB_small), indirect_policy_DB_small - mean(indirect_policy_DB_small)) + runif(21,-0.5,0.5)
+
+for (k in 1:max_iter) {
+    
+    # Solve the convex subproblem
+    cat(k,'-th iteration of DC algorithm','\n')
+    sub_result <- optim(par = par_initial, 
+                        fn = compute_total_loss_smooth_dc_approx, 
+                        # gr = d_compute_total_loss_smooth_dc_approx, # we try the case with/without gr
+                        params_old = par_initial + 0.1, 
+                        K = cbind(rep(1,20),diag(20)), 
+                        T = data$logWellDepth[sub_indices],
+                        krige_adjust = krige_values_RKHS[sub_indices],
+                        outcome_resid = rep(0,20),
+                        propensity_est = rep(1,20),
+                        lambda = 0, 
+                        smoothers = smoothers_RKHS[sub_indices], 
+                        cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+                        kernel_bw = kernel_bw, 
+                        trt_bounds = depth_range,
+                        threshold_val = log(5), 
+                        clip_epsilon = clip_epsilon,
+                        clip_epsilon_bar = clip_epsilon_bar,
+                        surrogate_type = surrogate_type,
+                        loss_type = loss_type,
+                        method = "L-BFGS-B", 
+                        control = list(maxit = 60, trace = 3))
+    
+    params <- sub_result$par
+    
+    # 3. Check for convergence
+    change <- sqrt(sum((params_old - params)^2))
+    cat(sprintf("Iter: %d, Change: %f, Objective: %f\n", k, change, sub_result$value))
+    
+    if (change < tol) {
+      cat("--- DC Algorithm Converged ---\n")
+      params_old <- params
+      break
+    }
+    
+    params_old <- params
+  }
+```
+
+```{r}
+plot(params_old, par_initial)
+```
+
+
+```{r}
+plot(indirect_policy_DB_small,cbind(rep(1,20),diag(20)) %*% params_old)
+```
+
+```{r}
+compute_total_loss_smooth_RKHS(params = params_old,
+                                   K = cbind(rep(1,20),diag(20)), 
+                                    T = data$logWellDepth[sub_indices],
+                                    krige_adjust = krige_values_RKHS[sub_indices],
+                                    outcome_resid = rep(0,20),
+                                    propensity_est = rep(1,20),
+                                    lambda = 0, 
+                                    smoothers = smoothers_RKHS[sub_indices], 
+                                    cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(5), 
+                                    clip_epsilon = clip_epsilon,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+
+compute_total_loss_smooth_RKHS(params = c(mean(indirect_policy_DB_small), indirect_policy_DB_small - mean(indirect_policy_DB_small)),
+                                   K = cbind(rep(1,20),diag(20)), 
+                                    T = data$logWellDepth[sub_indices],
+                                    krige_adjust = krige_values_RKHS[sub_indices],
+                                    outcome_resid = rep(0,20),
+                                    propensity_est = rep(1,20),
+                                    lambda = 0, 
+                                    smoothers = smoothers_RKHS[sub_indices], 
+                                    cumint_smoothers = cumint_smoothers_RKHS[sub_indices], 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(5), 
+                                    clip_epsilon = clip_epsilon,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+```
+
+
+##### if we set grand matrix as identity matrix, it should return the indirect method
+
+
+```{r}
+surrogate_type <- "Gaussian"
+
+# loss_type <- "ipw"
+# resids <- data$logconcentration_plus_median
+# krige_adjust <- rep(0, nrow(data))
+
+loss_type <- 'or'
+resids <- data$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+krige_adjust <- krige_values_RKHS
+
+# loss_type <- 'db'
+# resids <- data$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+# krige_adjust <- krige_values_RKHS
+
+smoothers <- smoothers_RKHS
+cumint_smoothers <- cumint_smoothers_RKHS
+
+direct_optim <- optim(par = params_initial_glmnet, 
+                      fn = compute_total_loss_smooth_RKHS, 
+                      gr = d_compute_total_loss_smooth_RKHS, 
+                      K = cbind(rep(1,nrow(data)), diag(nrow(data))), 
+                      T = data$logWellDepth,
+                      krige_adjust = krige_adjust,
+                      outcome_resid = resids,
+                      propensity_est = pmax(gps_est,0.001),
+                      lambda = 0, 
+                      smoothers = smoothers, 
+                      cumint_smoothers = cumint_smoothers, 
+                      kernel_bw = kernel_bw, 
+                      trt_bounds = depth_range,
+                      threshold_val = log(5), 
+                      clip_epsilon = clip_epsilon,
+                      surrogate_type = surrogate_type,
+                      loss_type = loss_type,
+                      method = "L-BFGS-B", 
+                      control = list(maxit = 60, trace = 4))
+```
+
+```{r}
+3744 * compute_total_loss_smooth_RKHS(params = direct_optim$par,
+                                   K = cbind(rep(1,nrow(data)), diag(nrow(data))),
+                                   T = data$logWellDepth,
+                                    krige_adjust = krige_adjust,
+                                    outcome_resid = resids,
+                                    propensity_est = pmax(gps_est,0.001),
+                                    lambda = 0, 
+                                    smoothers = smoothers, 
+                                    cumint_smoothers = cumint_smoothers, 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(5), 
+                                    clip_epsilon = clip_epsilon,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+
+3744 * compute_total_loss_smooth_RKHS(params = c(mean(indirect_policy_DB), indirect_policy_DB - mean(indirect_policy_DB)),
+                                   K = cbind(rep(1,nrow(data)), diag(nrow(data))),
+                                   T = data$logWellDepth,
+                                    krige_adjust = krige_adjust,
+                                    outcome_resid = resids,
+                                    propensity_est = pmax(gps_est,0.001),
+                                    lambda = 0, 
+                                    smoothers = smoothers, 
+                                    cumint_smoothers = cumint_smoothers, 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(5), 
+                                    clip_epsilon = clip_epsilon,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+
+d_compute_total_loss_smooth_RKHS(params = c(mean(indirect_policy_DB), indirect_policy_DB - mean(indirect_policy_DB)),
+                                 K = cbind(rep(1,nrow(data)), diag(nrow(data))),
+                                 T = data$logWellDepth,
+                                  krige_adjust = krige_adjust,
+                                  outcome_resid = resids,
+                                  propensity_est = pmax(gps_est,0.001),
+                                  lambda = 0, 
+                                  smoothers = smoothers, 
+                                  cumint_smoothers = cumint_smoothers, 
+                                  kernel_bw = kernel_bw, 
+                                  trt_bounds = depth_range,
+                                  threshold_val = log(5), 
+                                  clip_epsilon = clip_epsilon,
+                                  surrogate_type = surrogate_type,
+                                  loss_type = loss_type)
+```
+
+
+```{r}
+cat('RKHS loss:')
+sum(compute_total_loss_smooth(assigned_trt = cbind(rep(1,nrow(data)), diag(nrow(data))) %*% direct_optim$par,
+                         subject_idx = 1:nrow(k_matrix),
+                         T = data$logWellDepth,
+                         krige_adjust = krige_adjust,
+                         outcome_resid = resids,
+                         propensity_est = gps_est,
+                         cumint_smoothers = cumint_smoothers,
+                         trt_bounds = depth_range,
+                         kernel_bw = kernel_bw, 
+                         threshold_val = threshold_val, 
+                         clip_epsilon = clip_epsilon,
+                         surrogate_type = "Gaussian",
+                         loss_type = "or"))
+cat('\n')
+cat('parametric loss:')
+sum(compute_total_loss_smooth(assigned_trt = indirect_policy_DB,
+                         subject_idx = 1:nrow(k_matrix),
+                         T = data$logWellDepth,
+                         krige_adjust = krige_adjust,
+                         outcome_resid = resids,
+                         propensity_est = gps_est,
+                         cumint_smoothers = cumint_smoothers,
+                         trt_bounds = depth_range,
+                         kernel_bw = kernel_bw, 
+                         threshold_val = threshold_val, 
+                         clip_epsilon = clip_epsilon,
+                         surrogate_type = "Gaussian",
+                         loss_type = "or"))
+cat('\n')
+```
+
+```{r}
+plot(indirect_policy_DB, cbind(rep(1,nrow(data)), diag(nrow(data))) %*% direct_optim$par)
+```
+
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, as.vector(cbind(rep(1,nrow(data)), diag(nrow(data))) %*% direct_optim$par)  > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor(as.vector(cbind(rep(1,nrow(data)), diag(nrow(data))) %*% direct_optim$par > data$logWellDepth)))
+```
+
+```{r}
+max_iter <- 50
+tol <- 1e-4
+clip_epsilon_bar <- 300
+clip_epsilon <- 1
+kernel_bw <- 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5)
+depth_range <- c(min(data$logWellDepth), max(data$logWellDepth))
+
+surrogate_type <- "Gaussian"
+
+# loss_type <- "ipw"
+# resids <- data$logconcentration_plus_median
+# krige_adjust <- rep(0, nrow(data))
+
+loss_type <- 'or'
+resids <- data$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+krige_adjust <- krige_values_RKHS
+
+# loss_type <- 'db'
+# resids <- data$logconcentration_plus_median - predict(svm_auto, newdata = design_matrix) - krige_values_RKHS
+# krige_adjust <- krige_values_RKHS
+
+
+gps_est <- dnorm(data$logWellDepth, mean = gps_mean_model$SL.predict, sd = gps_sigma)
+
+params_old <- params_initial_glmnet
+params <- params_initial_glmnet
+
+smoothers <- smoothers_RKHS
+cumint_smoothers <- cumint_smoothers_RKHS
+threshold_val <- log(5)
+
+for (k in 1:max_iter) {
+    
+    # Solve the convex subproblem
+    cat(k,'-th iteration of DC algorithm','\n')
+    sub_result <- optim(par = params_old, 
+                        fn = compute_total_loss_smooth_dc_approx, 
+                        gr = d_compute_total_loss_smooth_dc_approx, # we try the case with/without gr
+                        params_old = params_old, 
+                        K = cbind(rep(1,nrow(data)), diag(nrow(data))), 
+                        T = data$logWellDepth,
+                        krige_adjust = krige_adjust,
+                        outcome_resid = resids,
+                        propensity_est = pmax(gps_est,0.001),
+                        lambda = 0, 
+                        smoothers = smoothers, 
+                        cumint_smoothers = cumint_smoothers, 
+                        kernel_bw = kernel_bw, 
+                        trt_bounds = depth_range,
+                        threshold_val = log(5), 
+                        clip_epsilon = clip_epsilon,
+                        clip_epsilon_bar = clip_epsilon_bar,
+                        surrogate_type = surrogate_type,
+                        loss_type = loss_type,
+                        method = "L-BFGS-B", 
+                        control = list(maxit = 60, trace = 3))
+    
+    params <- sub_result$par
+    
+    # 3. Check for convergence
+    change <- sqrt(sum((params_old - params)^2))
+    cat(sprintf("Iter: %d, Change: %f, Objective: %f\n", k, change, sub_result$value))
+    
+    if (change < tol) {
+      cat("--- DC Algorithm Converged ---\n")
+      params_old <- params
+      break
+    }
+    
+    params_old <- params
+  }
+```
+
+```{r}
+cat('RKHS loss:')
+sum(compute_total_loss_smooth(assigned_trt = cbind(rep(1,nrow(data)), diag(nrow(data))) %*% params_old,
+                         subject_idx = 1:nrow(k_matrix),
+                         T = data$logWellDepth,
+                         krige_adjust = krige_adjust,
+                         outcome_resid = resids,
+                         propensity_est = gps_est,
+                         cumint_smoothers = cumint_smoothers,
+                         trt_bounds = depth_range,
+                         kernel_bw = kernel_bw, 
+                         threshold_val = threshold_val, 
+                         clip_epsilon = clip_epsilon,
+                         surrogate_type = "Gaussian",
+                         loss_type = "or"))
+cat('\n')
+cat('parametric loss:')
+sum(compute_total_loss_smooth(assigned_trt = indirect_policy_DB,
+                         subject_idx = 1:nrow(k_matrix),
+                         T = data$logWellDepth,
+                         krige_adjust = krige_adjust,
+                         outcome_resid = resids,
+                         propensity_est = gps_est,
+                         cumint_smoothers = cumint_smoothers,
+                         trt_bounds = depth_range,
+                         kernel_bw = kernel_bw, 
+                         threshold_val = threshold_val, 
+                         clip_epsilon = clip_epsilon,
+                         surrogate_type = "Gaussian",
+                         loss_type = "or"))
+cat('\n')
+```
+
+```{r}
+plot(indirect_policy_DB, cbind(rep(1,nrow(data)), diag(nrow(data))) %*% params_old)
+```
+```{r}
+Metrics::accuracy(log(data$concentration_plus_median) > threshold_val, as.vector(cbind(rep(1,nrow(data)), diag(nrow(data))) %*% params_old)  > data$logWellDepth)
+yardstick::mcc_vec(truth = as.factor(log(data$concentration_plus_median) > threshold_val), estimate = as.factor(as.vector(cbind(rep(1,nrow(data)), diag(nrow(data))) %*% params_old > data$logWellDepth)))
+```
+
+
+#### Visualize and Test the Loss functions
+
+##### Test DC gradient
+
+###### Test the parametric case
+
+
+```{r}
+# resids <- data$logconcentration_plus_median
+# loss_type <- 'ipw'
+# krige_adjust <- rep(0, nrow(data))
+
+# resids <- data$logconcentration_plus_median - predict(OR_mean_model_xgboost, design_matrix) - krige_values
+# loss_type <- 'or'
+# krige_adjust <- krige_values
+
+resids <- data$logconcentration_plus_median - predict(OR_mean_model_xgboost, design_matrix) - krige_values
+loss_type <- 'db'
+krige_adjust <- krige_values
+
+
+params_old <- runif(ncol(design_matrix) ,min = -20, max = 50)
+```
+
+```{r}
+# subset_indice <- c(1,2)
+subset_indice <- 1:nrow(data)
+# resids <- data$logconcentration_plus_median - predict(OR_mean_model_xgboost, design_matrix) - krige_values
+# loss_type <- 'or'
+# krige_adjust <- krige_values
+
+
+
+d_compute_total_loss_smooth_dc_approx(params = params_old * 1.1, 
+                                    params_old = params_old, 
+                                    K = design_matrix[subset_indice,], 
+                                    T = data$logWellDepth[subset_indice],
+                                    krige_adjust = krige_adjust[subset_indice],
+                                    outcome_resid = resids[subset_indice],
+                                    propensity_est = pmax(gps_est[subset_indice],0.001),
+                                    lambda = 0, 
+                                    smoothers = smoothers[subset_indice], 
+                                    cumint_smoothers = cumint_smoothers[subset_indice], 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(10), 
+                                    clip_epsilon = clip_epsilon,
+                                    clip_epsilon_bar = clip_epsilon_bar,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+```
+```{r}
+grad(func = function(params){
+  compute_total_loss_smooth_dc_approx(params = params, 
+                                    params_old = params_old, 
+                                    K = design_matrix[subset_indice,], 
+                                    T = data$logWellDepth[subset_indice],
+                                    krige_adjust = krige_adjust[subset_indice],
+                                    outcome_resid = resids[subset_indice],
+                                    propensity_est = pmax(gps_est[subset_indice],0.001),
+                                    lambda = 0, 
+                                    smoothers = smoothers, 
+                                    cumint_smoothers = cumint_smoothers, 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(10), 
+                                    clip_epsilon = clip_epsilon,
+                                    clip_epsilon_bar = clip_epsilon_bar,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)},
+  x = params_old * 1.1)
+```
+
+When the value goes wild they are totally different, so the derivative might be wrong outside the depth_range
+Let's see what happens
+
+```{r}
+params = params_old * 1.1
+params_old = params_old
+K = design_matrix[subset_indice,]
+T = data$logWellDepth[subset_indice]
+krige_adjust = krige_adjust[subset_indice]
+outcome_resid = resids[subset_indice]
+propensity_est = pmax(gps_est[subset_indice],0.001)
+lambda = 0
+smoothers = smoothers[subset_indice]
+cumint_smoothers = cumint_smoothers[subset_indice]
+kernel_bw = kernel_bw
+trt_bounds = depth_range
+threshold_val = log(10)
+clip_epsilon = clip_epsilon
+clip_epsilon_bar = clip_epsilon_bar
+```
+
+```{r}
+n <- nrow(K)
+  
+assigned_trt <- as.vector(K %*% params)
+
+assigned_trt_old <- as.vector(K %*% params_old)
+
+d_total_loss_plus <- d_compute_total_loss_smooth_plus(assigned_trt = assigned_trt,
+                                                      subject_idx = 1:n,
+                                                      T = T,
+                                                      krige_adjust = krige_adjust,
+                                                      outcome_resid = outcome_resid,
+                                                      propensity_est = propensity_est,
+                                                      smoothers = smoothers,
+                                                      trt_bounds = trt_bounds,
+                                                      threshold_val = threshold_val,
+                                                      kernel_bw = kernel_bw,
+                                                      clip_epsilon = clip_epsilon,
+                                                      clip_epsilon_bar = clip_epsilon_bar,
+                                                      surrogate_type = surrogate_type,
+                                                      loss_type = loss_type) 
+
+d_total_loss_minus_old <- d_compute_total_loss_smooth_minus(assigned_trt = assigned_trt_old,
+                                                          subject_idx = 1:n,
+                                                          T = T,
+                                                          krige_adjust = krige_adjust,
+                                                          outcome_resid = outcome_resid,
+                                                          propensity_est = propensity_est,
+                                                          smoothers = smoothers,
+                                                          trt_bounds = trt_bounds,
+                                                          threshold_val = threshold_val,
+                                                          kernel_bw = kernel_bw,
+                                                          clip_epsilon = clip_epsilon,
+                                                          clip_epsilon_bar = clip_epsilon_bar,
+                                                          surrogate_type = surrogate_type,
+                                                          loss_type = loss_type)
+
+if(lambda == 0){
+  penalty <- rep(0, ncol(K))
+} else {
+  if(ncol(K) < nrow(K)){
+    penalty <- c(0, (1/n) * lambda * as.vector(params[-1]))  
+  }
+  else {
+    penalty <- c(0, (1/n) * lambda * as.vector(K[,-1] %*% params[-1]))  
+  }
+}
+
+d_total_loss_dc_approx <- as.numeric(t(K) %*% (d_total_loss_plus - d_total_loss_minus_old))/n + penalty
+```
+
+```{r}
+d_total_loss_dc_approx
+```
+```{r}
+grad(func = compute_total_loss_smooth_plus, x = assigned_trt,
+                                                      subject_idx = 1:n,
+                                                      T = T,
+                                                      krige_adjust = krige_adjust,
+                                                      outcome_resid = outcome_resid,
+                                                      propensity_est = propensity_est,
+                                                      cumint_smoothers = cumint_smoothers,
+                                                      trt_bounds = trt_bounds,
+                                                      threshold_val = threshold_val,
+                                                      kernel_bw = kernel_bw,
+                                                      clip_epsilon = clip_epsilon,
+                                                      clip_epsilon_bar = clip_epsilon_bar,
+                                                      surrogate_type = surrogate_type,
+                                                      loss_type = loss_type)
+```
+
+
+
+###### Test RKHS case
+
+```{r}
+params = params_initial * 1.1
+params_old = params_initial
+K = k_matrix
+T = data$logWellDepth
+krige_adjust = rep(0, nrow(data))
+outcome_resid = resids
+propensity_est = pmax(gps_est,0.001)
+lambda = 10
+smoothers = smoothers
+cumint_smoothers = cumint_smoothers
+kernel_bw = kernel_bw
+trt_bounds = depth_range
+threshold_val = log(10)
+clip_epsilon = clip_epsilon
+clip_epsilon_bar = clip_epsilon_bar
+surrogate_type = surrogate_type
+loss_type = loss_type
+```
+
+```{r}
+assigned_trt <- as.vector(K %*% params)
+  
+assigned_trt_old <- as.vector(K %*% params_old)
+```
+
+```{r}
+subject_idx <- 1
+```
+
+```{r}
+# compute with grad
+
+a = grad(func = function(params){
+  total_loss_plus <- compute_total_loss_smooth_plus(assigned_trt = assigned_trt[subject_idx],
+                                                    subject_idx = subject_idx,
+                                                    T = T,
+                                                    krige_adjust = krige_adjust,
+                                                    outcome_resid = outcome_resid,
+                                                    propensity_est = propensity_est,
+                                                    cumint_smoothers = cumint_smoothers,
+                                                    trt_bounds = trt_bounds,
+                                                    threshold_val = threshold_val,
+                                                    kernel_bw = kernel_bw,
+                                                    clip_epsilon = clip_epsilon,
+                                                    clip_epsilon_bar = clip_epsilon_bar,
+                                                    surrogate_type = surrogate_type,
+                                                    loss_type = loss_type) 
+  d_total_loss_minus_old <- d_compute_total_loss_smooth_minus(assigned_trt = assigned_trt_old[subject_idx],
+                                                              subject_idx = subject_idx,
+                                                              T = T,
+                                                              krige_adjust = krige_adjust,
+                                                              outcome_resid = outcome_resid,
+                                                              propensity_est = propensity_est,
+                                                              smoothers = smoothers,
+                                                              trt_bounds = trt_bounds,
+                                                              threshold_val = threshold_val,
+                                                              kernel_bw = kernel_bw,
+                                                              clip_epsilon = clip_epsilon,
+                                                              clip_epsilon_bar = clip_epsilon_bar,
+                                                              surrogate_type = surrogate_type,
+                                                              loss_type = loss_type)
+  return(mean(total_loss_plus - d_total_loss_minus_old * assigned_trt[subject_idx]))},
+  x = params
+  )
+```
+
+
+##### DC approx loss function
+
+```{r}
+compute_total_loss_smooth_dc_approx(params = params_old * 1.1, 
+                                    params_old = params_old, 
+                                    K = k_matrix, 
+                                    T = data$logWellDepth,
+                                    krige_adjust = rep(0, nrow(data)),
+                                    outcome_resid = resids,
+                                    propensity_est = pmax(gps_est,0.001),
+                                    lambda = 10, 
+                                    smoothers = smoothers, 
+                                    cumint_smoothers = cumint_smoothers, 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(10), 
+                                    clip_epsilon = clip_epsilon,
+                                    clip_epsilon_bar = clip_epsilon_bar,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+```
+
+```{r}
+# This is too slow and cannot be implemented
+grad(func = compute_total_loss_smooth_dc_approx, x = params_old * 1.1, params_old = params_old, 
+                                    K = k_matrix, 
+                                    T = data$logWellDepth,
+                                    krige_adjust = rep(0, nrow(data)),
+                                    outcome_resid = resids,
+                                    propensity_est = pmax(gps_est,0.001),
+                                    lambda = 10, 
+                                    smoothers = smoothers, 
+                                    cumint_smoothers = cumint_smoothers, 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(10), 
+                                    clip_epsilon = clip_epsilon,
+                                    clip_epsilon_bar = clip_epsilon_bar,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+```
+
+```{r}
+d = d_compute_total_loss_smooth_dc_approx(params = params_old * 1.1, 
+                                    params_old = params_old, 
+                                    K = k_matrix, 
+                                    T = data$logWellDepth,
+                                    krige_adjust = rep(0, nrow(data)),
+                                    outcome_resid = resids,
+                                    propensity_est = pmax(gps_est,0.001),
+                                    lambda = 10, 
+                                    smoothers = smoothers, 
+                                    cumint_smoothers = cumint_smoothers, 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(10), 
+                                    clip_epsilon = clip_epsilon,
+                                    clip_epsilon_bar = clip_epsilon_bar,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+```
+
+
+```{r}
+surrogate_type = "Gaussian"
+loss_type = "ipw"
+
+i <- 10
+clip_epsilon_bar <- 200
+
+clip_epsilon <- 10
+threshold_val <- log(10)
+
+knots <-  seq(depth_range[1] - 2, depth_range[2] + 2, length.out = 100)
+
+kernel_bw <- 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5)
+depth_range <- c(min(data$logWellDepth), max(data$logWellDepth))
+
+
+total_loss_plus <- compute_total_loss_smooth_plus(assigned_trt = assigned_trt,
+                                                    subject_idx = 1:n,
+                                                    T = T,
+                                                    krige_adjust = krige_adjust,
+                                                    outcome_resid = outcome_resid,
+                                                    propensity_est = propensity_est,
+                                                    cumint_smoothers = cumint_smoothers,
+                                                    trt_bounds = trt_bounds,
+                                                    threshold_val = threshold_val,
+                                                    kernel_bw = kernel_bw,
+                                                    clip_epsilon = clip_epsilon,
+                                                    clip_epsilon_bar = clip_epsilon_bar,
+                                                    surrogate_type = surrogate_type,
+                                                    loss_type = loss_type) 
+  
+  
+d_total_loss_minus_old <- d_compute_total_loss_smooth_minus(assigned_trt = assigned_trt_old,
+                                                              subject_idx = 1:n,
+                                                              T = T,
+                                                              krige_adjust = krige_adjust,
+                                                              outcome_resid = outcome_resid,
+                                                              propensity_est = propensity_est,
+                                                              smoothers = smoothers,
+                                                              trt_bounds = trt_bounds,
+                                                              threshold_val = threshold_val,
+                                                              kernel_bw = kernel_bw,
+                                                              clip_epsilon = clip_epsilon,
+                                                              clip_epsilon_bar = clip_epsilon_bar,
+                                                              surrogate_type = surrogate_type,
+                                                              loss_type = loss_type)
+  
+total_loss_plus - d_total_loss_minus_old * assigned_trt
+```
+
+##### Loss function
+
+```{r}
+surrogate_type = "Gaussian"
+loss_type = "ipw"
+i <- 2
+clip_epsilon_bar <- 200
+clip_epsilon <- 10
+threshold_val <- log(10)
+
+knots <-  seq(depth_range[1] - 2, depth_range[2] + 2, length.out = 100)
+
+kernel_bw <- 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5)
+depth_range <- c(min(data$logWellDepth), max(data$logWellDepth))
+
+surrogate_type <- "Gaussian"
+
+loss_type <- "ipw"
+
+plot(knots, sapply(knots, compute_total_loss_smooth,  subject_idx = i,
+                            T = data$logWellDepth,
+                            krige_adjust = rep(0, nrow(data)),
+                            outcome_resid = data$logconcentration_plus_median,
+                            propensity_est = gps_est,
+                            cumint_smoothers = cumint_smoothers,
+                            trt_bounds = depth_range,
+                            threshold_val = threshold_val,
+                            kernel_bw = kernel_bw,
+                            clip_epsilon = clip_epsilon,
+                            surrogate_type,
+                            loss_type))
+
+plot(knots, sapply(knots, compute_total_loss_smooth_plus,  subject_idx = i,
+                            T = data$logWellDepth,
+                            krige_adjust = rep(0, nrow(data)),
+                            outcome_resid = data$logconcentration_plus_median,
+                            propensity_est = gps_est,
+                            cumint_smoothers = cumint_smoothers,
+                            trt_bounds = depth_range,
+                            threshold_val = threshold_val,
+                            kernel_bw = kernel_bw,
+                            clip_epsilon = clip_epsilon,
+                            clip_epsilon_bar = clip_epsilon_bar,
+                            surrogate_type,
+                            loss_type))
+
+plot(knots, sapply(knots, compute_total_loss_smooth_minus,  subject_idx = i,
+                             T = data$logWellDepth,
+                            krige_adjust = rep(0, nrow(data)),
+                            outcome_resid = data$logconcentration_plus_median,
+                            propensity_est = gps_est,
+                            cumint_smoothers = cumint_smoothers,
+                            trt_bounds = depth_range,
+                            threshold_val = threshold_val,
+                            kernel_bw = kernel_bw,
+                            clip_epsilon = clip_epsilon,
+                            clip_epsilon_bar,
+                            surrogate_type,
+                            loss_type))
+
+plot(knots, sapply(knots, compute_total_loss_smooth_plus,  subject_idx = i,
+                             T = data$logWellDepth,
+                            krige_adjust = rep(0, nrow(data)),
+                            outcome_resid = data$logconcentration_plus_median,
+                            propensity_est = gps_est,
+                            cumint_smoothers = cumint_smoothers,
+                            trt_bounds = depth_range,
+                            threshold_val = threshold_val,
+                            kernel_bw = kernel_bw,
+                            clip_epsilon = clip_epsilon,
+                            clip_epsilon_bar,
+                            surrogate_type,
+                            loss_type) - sapply(knots, compute_total_loss_smooth_minus,  subject_idx = i,
+                             T = data$logWellDepth,
+                            krige_adjust = rep(0, nrow(data)),
+                            outcome_resid = data$logconcentration_plus_median,
+                            propensity_est = gps_est,
+                            cumint_smoothers = cumint_smoothers,
+                            trt_bounds = depth_range,
+                            threshold_val = threshold_val,
+                            kernel_bw = kernel_bw,
+                            clip_epsilon = clip_epsilon,
+                            clip_epsilon_bar,
+                            surrogate_type,
+                            loss_type))
+
+```
+
+
+
+##### Visualize loss function
+
+```{r}
+surrogate_type = "Gaussian"
+loss_type = "ipw"
+i = 10
+clip_epsilon_bar = 50
+knots <- seq(-6, 6, length.out = 100)
+
+plot(knots, sapply(knots, compute_total_loss_smooth,  subject_idx = i,
+                            T = data$T,
+                            krige_adjust = krige_values,
+                            outcome_resid = data$Y,
+                            propensity_est = gps_est,
+                            cumint_smoothers = cumint_smoothers,
+                            trt_bounds = trt_bounds,
+                            threshold_val = threshold_val,
+                            kernel_bw = kernel_bw,
+                            clip_epsilon = 1,
+                            surrogate_type,
+                            loss_type))
+
+plot(knots, sapply(knots, compute_total_loss_smooth_plus,  subject_idx = i,
+                             T = data$T,
+                            krige_adjust = krige_values,
+                            outcome_resid = data$Y,
+                            propensity_est = gps_est,
+                            cumint_smoothers = cumint_smoothers,
+                            trt_bounds = trt_bounds,
+                            threshold_val = threshold_val,
+                            kernel_bw = kernel_bw,
+                            clip_epsilon = 1,
+                            clip_epsilon_bar,
+                            surrogate_type,
+                            loss_type))
+
+plot(knots, sapply(knots, compute_total_loss_smooth_minus,  subject_idx = i,
+                             T = data$T,
+                            krige_adjust = krige_values,
+                            outcome_resid = data$Y,
+                            propensity_est = gps_est,
+                            cumint_smoothers = cumint_smoothers,
+                            trt_bounds = trt_bounds,
+                            threshold_val = threshold_val,
+                            kernel_bw = kernel_bw,
+                            clip_epsilon = 1,
+                            clip_epsilon_bar,
+                            surrogate_type,
+                            loss_type))
+
+plot(knots, sapply(knots, compute_total_loss_smooth_plus,  subject_idx = i,
+                             T = data$T,
+                            krige_adjust = krige_values,
+                            outcome_resid = data$Y,
+                            propensity_est = gps_est,
+                            cumint_smoothers = cumint_smoothers,
+                            trt_bounds = trt_bounds,
+                            threshold_val = threshold_val,
+                            kernel_bw = kernel_bw,
+                            clip_epsilon = 1,
+                            clip_epsilon_bar,
+                            surrogate_type,
+                            loss_type) - sapply(knots, compute_total_loss_smooth_minus,  subject_idx = i,
+                             T = data$T,
+                            krige_adjust = krige_values,
+                            outcome_resid = data$Y,
+                            propensity_est = gps_est,
+                            cumint_smoothers = cumint_smoothers,
+                            trt_bounds = trt_bounds,
+                            threshold_val = threshold_val,
+                            kernel_bw = kernel_bw,
+                            clip_epsilon = 1,
+                            clip_epsilon_bar,
+                            surrogate_type,
+                            loss_type))
+
+```
+
+
+##### Test Gradient of DC
+
+```{r}
+grad(func = compute_total_loss_smooth_dc_approx, x = params_old * 1.1, params_old = params_old, 
+                                    K = k_matrix, 
+                                    T = data$logWellDepth,
+                                    krige_adjust = rep(0, nrow(data)),
+                                    outcome_resid = resids,
+                                    propensity_est = pmax(gps_est,0.001),
+                                    lambda = 10, 
+                                    smoothers = smoothers, 
+                                    cumint_smoothers = cumint_smoothers, 
+                                    kernel_bw = kernel_bw, 
+                                    trt_bounds = depth_range,
+                                    threshold_val = log(10), 
+                                    clip_epsilon = clip_epsilon,
+                                    clip_epsilon_bar = clip_epsilon_bar,
+                                    surrogate_type = surrogate_type,
+                                    loss_type = loss_type)
+```
+
+
+```{r}
+
+```
+
+
+##### Test gradient os plus, minus
+
+```{r}
+
+knots <- seq(depth_range[1] - 20, depth_range[2] + 20, length.out = 200)
+i <- 100
+
+d1 <- sapply(knots, d_compute_total_loss_smooth_plus, subject_idx = i, T = data$logWellDepth, 
+                   krige_adjust = rep(0, nrow(data)), outcome_resid =  data$logconcentration_plus_median, 
+                   propensity_est = gps_est,
+                        smoothers = smoothers, 
+                        
+                        kernel_bw = 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5),
+                        trt_bounds = depth_range,
+                        threshold_val = log(10), 
+                        clip_epsilon = 1,
+                        clip_epsilon_bar = 400,
+                        surrogate_type = "Gaussian",
+                        loss_type = "ipw")
+
+plot(knots, d1)
+
+d2 <- sapply(knots, function(assigned_trt){
+  grad(func = compute_total_loss_smooth_plus, x = assigned_trt, subject_idx = i, T = data$logWellDepth, 
+                  krige_adjust = rep(0, nrow(data)), outcome_resid =  data$logconcentration_plus_median, 
+                  propensity_est = gps_est, cumint_smoothers = cumint_smoothers,
+                  kernel_bw = 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5),
+                  trt_bounds = depth_range,
+                  threshold_val = log(10), 
+                  clip_epsilon = 1,
+                  clip_epsilon_bar = 400,
+                  surrogate_type = "Gaussian",
+                  loss_type = "ipw")
+})
+  
+plot(knots, d2)
+
+                                           
+```
+
+```{r}
+d1 - d2
+```
+
+
+```{r}
+
+knots <- seq(depth_range[1] - 20, depth_range[2] + 20, length.out = 200)
+i <- 1
+d3 <- sapply(knots, d_compute_total_loss_smooth_minus, subject_idx = i, T = data$logWellDepth, 
+                   krige_adjust = rep(0, nrow(data)), outcome_resid =  data$logconcentration_plus_median, 
+                   propensity_est = gps_est,
+                        smoothers = smoothers, 
+                        
+                        kernel_bw = 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5),
+                        trt_bounds = depth_range,
+                        threshold_val = log(10), 
+                        clip_epsilon = 1,
+                        clip_epsilon_bar = 400,
+                        surrogate_type = "Gaussian",
+                        loss_type = "ipw")
+plot(knots, d3)
+
+d4 <- sapply(knots, function(assigned_trt){
+  grad(func = compute_total_loss_smooth_minus, x = assigned_trt, subject_idx = i, T = data$logWellDepth, 
+                  krige_adjust = rep(0, nrow(data)), outcome_resid =  data$logconcentration_plus_median, 
+                  propensity_est = gps_est, cumint_smoothers = cumint_smoothers,
+                  kernel_bw = 1.06 * sd(data$logWellDepth) *nrow(data)^(-1/5),
+                  trt_bounds = depth_range,
+                  threshold_val = log(10), 
+                  clip_epsilon = 1,
+                  clip_epsilon_bar = 400,
+                  surrogate_type = "Gaussian",
+                  loss_type = "ipw")
+})
+
+plot(knots, d4)
+
+d3 - d4                                           
+```
+
+
+```{r}
+grad(function(coefs){
+  assigned_trt <- design_matrix %*% coefs
+  return(sum(compute_total_loss_smooth_plus(assigned_trt = assigned_trt,
+                                 subject_idx = 1:nrow(data$X),
+                                 T = data$T,
+                                 krige_adjust = krige_values,
+                                 outcome_resid = resids,
+                                 propensity_est = gps_est,
+                                 cumint_smoothers = cumint_smoothers,
+                                 trt_bounds = c(-4, 4),
+                                 threshold_val = threshold_val,
+                                 kernel_bw = kernel_bw,
+                                 clip_epsilon = 1,
+                                 clip_epsilon_bar,
+                                 surrogate_type = "Gaussian",
+                                 loss_type = "db")))},
+  x = coefs)
+```
+
+

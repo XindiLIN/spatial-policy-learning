@@ -16,7 +16,7 @@ Rplots.pdf
 
 # Generated/regenerable simulation and analysis outputs -- re-run the scripts to reproduce
 simulation/output/
-nitrate data analysis/output/
+nitrate_data_analysis/output/
 
 # Claude Code local (machine-specific) settings
 .claude/settings.local.json
