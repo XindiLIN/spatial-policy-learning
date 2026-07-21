@@ -208,6 +208,10 @@ cv_task_grid <- expand.grid(thr_idx = seq_len(nrow(thr_grid)), m = m_lst)
 hp_partial_dir <- 'simulation/output/hp_partial'
 dir.create(hp_partial_dir, recursive = TRUE, showWarnings = FALSE)
 
+hp_partial_path <- function(thr_idx, m) {
+  file.path(hp_partial_dir, sprintf("thr%02d_m%s.rds", thr_idx, gsub("-", "neg", sprintf("%.2f", m))))
+}
+
 run_one_cv_group <- function(thr_idx, m){
   ctx <- thr_ctxs[[thr_idx]]
   label <- sprintf("seed=%d | threshold_quantile=%.2f | m=%.2f", ctx$seed_value, ctx$threshold_quantile, m)
@@ -227,22 +231,56 @@ run_one_cv_group <- function(thr_idx, m){
   # Incremental checkpoint: each of Phase C's 90 tasks writes its own result to disk the
   # moment it finishes, rather than only after the whole mclapply call returns. If a later
   # task crashes/OOMs, this task's result is already safely on disk.
-  partial_path <- file.path(hp_partial_dir, sprintf("thr%02d_m%s.rds", thr_idx, gsub("-", "neg", sprintf("%.2f", m))))
-  saveRDS(result, file = partial_path)
+  saveRDS(result, file = hp_partial_path(thr_idx, m))
 
   cat(sprintf("%s: finished\n", label))
   result
 }
 
-cat(sprintf("Phase C: %d-fold CV hyperparameter search (%d seed x threshold x m tasks)\n", n_folds, nrow(cv_task_grid)))
-hp_results <- parallel::mclapply(1:nrow(cv_task_grid), function(k){
-  run_one_cv_group(cv_task_grid$thr_idx[k], cv_task_grid$m[k])
-}, mc.cores = n_cores)
+# Skip any (thr_idx, m) task that already has a checkpoint file from a previous run (e.g.
+# one that OOM'd partway through), and retry whatever's still missing in a loop -- each
+# retry only tackles the shrinking set of missing tasks, re-checking hp_partial/ after every
+# pass, so mc.cores naturally scales down with it and later retries face less concurrent
+# memory pressure than the first attempt did.
+max_phase_c_attempts <- 5
 
-failed <- vapply(hp_results, function(x) inherits(x, "try-error"), logical(1))
-if (any(failed)) stop(sprintf("Phase C failed for task(s): %s", paste(which(failed), collapse = ", ")))
+for (attempt in seq_len(max_phase_c_attempts)) {
+  already_done <- file.exists(hp_partial_path(cv_task_grid$thr_idx, cv_task_grid$m))
+  todo_grid <- cv_task_grid[!already_done, , drop = FALSE]
 
-hp_results_all <- bind_rows(hp_results)
+  if (nrow(todo_grid) == 0) {
+    if (attempt == 1) {
+      cat(sprintf("Phase C: all %d tasks already done, nothing to run\n", nrow(cv_task_grid)))
+    }
+    break
+  }
+
+  cat(sprintf("Phase C attempt %d/%d: %d of %d tasks remaining\n",
+              attempt, max_phase_c_attempts, nrow(todo_grid), nrow(cv_task_grid)))
+
+  parallel::mclapply(seq_len(nrow(todo_grid)), function(k){
+    run_one_cv_group(todo_grid$thr_idx[k], todo_grid$m[k])
+  }, mc.cores = min(nrow(todo_grid), n_cores))
+}
+
+# Reassemble the full 90-task result set from whatever's on disk now. Reading back from
+# hp_partial/ (rather than collecting mclapply's return values directly) means tasks a
+# previous run or an earlier retry already finished aren't lost even if a later retry's
+# mclapply call fails partway through on the remaining tasks.
+hp_results <- lapply(seq_len(nrow(cv_task_grid)), function(k) {
+  path <- hp_partial_path(cv_task_grid$thr_idx[k], cv_task_grid$m[k])
+  if (file.exists(path)) readRDS(path) else NULL
+})
+
+missing <- vapply(hp_results, function(x) is.null(x) || inherits(x, "try-error"), logical(1))
+if (any(missing)) {
+  missing_desc <- sprintf("thr_idx=%d, m=%.2f", cv_task_grid$thr_idx[missing], cv_task_grid$m[missing])
+  cat(sprintf("WARNING: %d of %d Phase C tasks are still missing after %d attempt(s):\n%s\n",
+              sum(missing), nrow(cv_task_grid), max_phase_c_attempts, paste(missing_desc, collapse = "\n")))
+  cat("Re-run this script again to retry just the missing tasks (already-completed ones will be skipped).\n")
+}
+
+hp_results_all <- bind_rows(hp_results[!missing])
 
 # Attach seed/threshold_quantile (rather than just the internal thr_idx) so the saved
 # hyperparameter-search results are self-describing, and mark the winning row per
@@ -257,4 +295,9 @@ for (idx in unique(hp_results_all$thr_idx)) {
 }
 saveRDS(hp_results_all, file = 'simulation/output/simulation_nonparametric_hp_results.rds')
 
-cat("Phases A-C complete. Run simulation_nonparametric_run_phaseD.R next.\n")
+if (any(missing)) {
+  cat(sprintf("Phase C incomplete: %d of %d tasks missing. Re-run this script to fill in the rest before running phase D.\n",
+              sum(missing), nrow(cv_task_grid)))
+} else {
+  cat("Phases A-C complete. Run simulation_nonparametric_run_phaseD.R next.\n")
+}
