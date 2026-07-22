@@ -18,7 +18,7 @@ df_diff <- estimated_policy_all %>%
   # Calculate squared differences
   mutate(
     diff_direct = abs(direct - optimal),
-    diff_indirect = abs(indirect - optimal),
+    # diff_indirect = abs(indirect - optimal),
     diff_indirect_nonsp = abs(indirect_nonsp - optimal)
   ) %>%
   dplyr::select(threshold_quantile, starts_with("diff_")) %>%
@@ -38,13 +38,14 @@ ggplot(df_diff) +
     breaks = c(0.4,0.5,0.6))+
   scale_y_continuous(
     name = "ABsolute Error", # Change the X-axis title here
-    breaks = c(0,2,6),
+    breaks = c(0,2,5),
     limits = c(0,6))+
   theme_bw() +
   scale_fill_brewer(palette = "Set2") +
-  scale_fill_manual(labels = c("direct" = "Direct", "indirect" = "Indirect", "indirect_nonsp" = "Non-spatial Indirect"),
+  scale_fill_manual(labels = c("direct" = "Direct", # "indirect" = "Indirect",
+                               "indirect_nonsp" = "Non-spatial Indirect"),
                     values = c("direct" = "#F8766D",
-                               "indirect" = "#00BFC4",
+                               # "indirect" = "#00BFC4",
                                "indirect_nonsp" = "#FDBF6F"),
                     name = "Estimation Method")
 
@@ -60,7 +61,8 @@ estimated_policy_all_wider <- estimated_policy_all %>%
 
 estimated_policy_all_wider_combine <- left_join(estimated_policy_all_wider, data_test_all, by = c('seed','threshold_quantile','test_obs_id'))
 
-performance_metrics <- expand.grid(method = c("direct", "indirect", "indirect_nonsp","optimal"), threshold_quantile = threshold_quantiles)
+performance_metrics <- expand.grid(method = c("direct", # "indirect",
+                                              "indirect_nonsp","optimal"), threshold_quantile = threshold_quantiles)
 performance_metrics$mcc <- NA
 performance_metrics$acc <- NA
 performance_metrics$two_sided_f1 <- NA
@@ -100,9 +102,10 @@ ggplot(df_long, aes(x = threshold_quantile, y = value, color = method)) +
   facet_wrap(~ metric, scales = "free_y", labeller = labeller(metric = metric_labs)) +  # 'scales = "free_y"' allows y-axis to vary per plot
   labs(title = "Performance Metrics by Threshold Quantile",
        x = "Threshold Quantile") +
-  scale_color_manual(labels = c("direct" = "Direct", "indirect" = "Indirect", "indirect_nonsp" = "Non-spatial Indirect", "optimal" = "True"),
+  scale_color_manual(labels = c("direct" = "Direct", # "indirect" = "Indirect",
+                                "indirect_nonsp" = "Non-spatial Indirect", "optimal" = "True"),
                    values = c("direct" = "#F8766D",
-                              "indirect" = "#00BFC4",
+                              # "indirect" = "#00BFC4",
                               "indirect_nonsp" = "#FDBF6F",
                               "optimal" = "purple"),
                    name = "Estimation Method") +
