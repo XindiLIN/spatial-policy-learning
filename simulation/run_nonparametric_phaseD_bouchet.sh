@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J nonparametric_sim_d
-#SBATCH -c 8
-#SBATCH --mem=64G
+#SBATCH -c 16
+#SBATCH --mem=128G
 #SBATCH -t 08:00:00
 #SBATCH -o slurm-d-%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL
