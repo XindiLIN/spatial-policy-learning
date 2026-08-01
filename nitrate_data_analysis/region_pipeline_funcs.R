@@ -68,6 +68,8 @@ fit_region_base <- function(data_split, area_key, output_dir,
                              RKHS_covariate_names = RKHS_COVARIATE_NAMES_DEFAULT,
                              use_cache = TRUE) {
 
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
   outcome_reg_path <- file.path(output_dir, sprintf("outcome_regression_%s.rds", area_key))
   if (use_cache && file.exists(outcome_reg_path)) {
     cat("Loading cached outcome regression...\n")
@@ -272,6 +274,8 @@ prep_direct_method_inputs <- function(data_split, region_base, kdm_info, m, kern
                                        RKHS_covariate_names = RKHS_COVARIATE_NAMES_DEFAULT,
                                        threshold_val, clip_epsilon_init = 20,
                                        mc.cores = 1, use_cache = TRUE) {
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
   outcome_reg <- region_base$outcome_reg
   depth_range <- region_base$depth_range

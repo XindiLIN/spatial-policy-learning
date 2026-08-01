@@ -43,6 +43,7 @@ cv_folds       <- 5                # number of CV folds
 optim_maxit_cv <- 300              # maxit for optim inside each CV fold
                                     # (lower = faster, less precise)
 output_dir     <- "nitrate_data_analysis/output"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 year_filter    <- 2020             # set NULL to use all years
 max_cv_attempts <- 5               # retry passes over still-missing (area, m) tasks
 
