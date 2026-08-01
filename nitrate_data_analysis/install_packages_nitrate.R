@@ -15,10 +15,15 @@ if (lib_dir == "") {
 dir.create(lib_dir, recursive = TRUE, showWarnings = FALSE)
 .libPaths(lib_dir)
 
-install.packages(
-  c("GpGp", "Metrics", "WeightIt", "caret", "dplyr", "e1071", "fields", "ggplot2", "glmnet",
-    "kernlab", "recipes", "sf", "yardstick", "emmeans", "patchwork", "tigris", "tidyr",
-    "stringr"),
-  lib = lib_dir,
-  repos = "https://cloud.r-project.org"
-)
+pkgs <- c("GpGp", "Metrics", "WeightIt", "caret", "dplyr", "e1071", "fields", "ggplot2", "glmnet",
+          "kernlab", "recipes", "sf", "yardstick", "emmeans", "patchwork", "tigris", "tidyr",
+          "stringr")
+# install.packages() reinstalls unconditionally even if a package is already present -- several
+# of these overlap with simulation/install_packages.R's list, so skip anything already installed
+# to avoid needlessly rebuilding them from source on the cluster.
+to_install <- setdiff(pkgs, rownames(installed.packages(lib.loc = lib_dir)))
+if (length(to_install) > 0) {
+  install.packages(to_install, lib = lib_dir, repos = "https://cloud.r-project.org")
+} else {
+  cat("All required packages already installed -- nothing to do.\n")
+}
