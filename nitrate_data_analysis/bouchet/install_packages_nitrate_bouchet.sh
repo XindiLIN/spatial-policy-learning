@@ -1,0 +1,14 @@
+#!/bin/bash
+#SBATCH -J install_r_packages_nitrate
+#SBATCH -c 4
+#SBATCH --mem=8G
+#SBATCH -t 04:00:00
+#SBATCH -o slurm-install-nitrate-%j.out
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=xindi.lin@yale.edu
+
+cd "$SLURM_SUBMIT_DIR"
+
+module reset
+module load R/4.4.2-gfbf-2024a
+Rscript nitrate_data_analysis/install_packages_nitrate.R
