@@ -135,13 +135,13 @@ policy_comparison_combine <- rbind(policy_comparison_south_east, policy_comparis
                                    policy_comparison_north_central, policy_comparison_south_west, policy_comparison_west_central,
                                    policy_comparison_east_central, policy_comparison_south_central, policy_comparison_central)
 
-policy_comparison_combine_sf <- st_as_sf(policy_comparison_combine,coords = c("longitude", "latitude"),crs = 4326)
+saveRDS(policy_comparison_combine, "nitrate_data_analysis/output/policy_comparison_combine.rds")
 
-policy_comparison_combine_sf_test <- policy_comparison_combine_sf[policy_comparison_combine_sf$test==1,]
 
-global_min <- min(c(policy_comparison_combine_sf$indirect_policy, 
-                    policy_comparison_combine_sf$policy), na.rm = TRUE)
-global_max <- log(2000)
-my_limits <- c(global_min, global_max)
+
+# global_min <- min(c(policy_comparison_combine_sf$indirect_policy, 
+#                     policy_comparison_combine_sf$policy), na.rm = TRUE)
+# global_max <- log(2000)
+# my_limits <- c(global_min, global_max)
 
 

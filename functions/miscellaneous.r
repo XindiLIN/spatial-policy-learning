@@ -1,8 +1,30 @@
 library(caret)
 library(recipes)
 library(e1071)
-source('functions/funcs_kriging.R')
-source('functions/loss_functions.R')
+
+# Resolve this file's own location so its own dependencies can be sourced
+# regardless of the caller's working directory (this file is sourced from
+# many places across the project with inconsistent cwd conventions -- see
+# region_pipeline_funcs.R for the same pattern and a fuller explanation).
+# Falls back to assuming cwd is already the repo root if this file wasn't
+# reached via source() (e.g. pasted directly into the console).
+.miscellaneous_r_path <- local({
+  for (i in rev(seq_len(sys.nframe()))) {
+    if (identical(sys.function(i), base::source)) {
+      ofile <- evalq(ofile, envir = sys.frame(i))
+      if (!is.null(ofile)) return(normalizePath(ofile))
+    }
+  }
+  NULL
+})
+.repo_root <- if (!is.null(.miscellaneous_r_path)) {
+  dirname(dirname(.miscellaneous_r_path))
+} else {
+  getwd()
+}
+
+source(file.path(.repo_root, "functions", "funcs_kriging.R"))
+source(file.path(.repo_root, "functions", "loss_functions.R"))
 
 ## I think this one using GP estimation (krige_values) from the outcome regression modeling is problematic
 
@@ -343,8 +365,6 @@ split_nitrate_data <- function(data, p = 0.7, seed = 1998){
 
 # we also add log-transformation, and area in this function
 load_nitrate_data <- function(file_path = "data/data_Nitrate_with_covar_median_well.csv", zero_inflated = FALSE){
-  command <- paste("brctl download", shQuote(file_path))
-  system(command)
   data <- read.csv(file_path)
   # Assuming 'data' is your data frame with a 'County' column.
   # Initialize the new 'area' column.
@@ -462,35 +482,37 @@ run_dc_algorithm <- function(params_initial,
                              clip_epsilon,
                              clip_epsilon_bar,
                              tol = 0.001,
-                             max_iter = 100){
-  
+                             max_iter = 100,
+                             optim_maxit = 300,
+                             optim_trace = 3){
+
   params_old <- params_initial
-  
+
   for(k in 1:max_iter){
-    
+
     cat(k,'-th iteration of DC algorithm','\n')
-    
-    sub_result <- optim(par = params_old, 
-                        fn = compute_total_loss_smooth_dc_approx_RKHS, 
-                        gr = d_compute_total_loss_smooth_dc_approx_RKHS, 
+
+    sub_result <- optim(par = params_old,
+                        fn = compute_total_loss_smooth_dc_approx_RKHS,
+                        gr = d_compute_total_loss_smooth_dc_approx_RKHS,
                         params_old = params_old,
                         K = k_matrix,
                         T = T,
                         krige_adjust = krige_adjust,
                         outcome_resid = outcome_resid,
                         propensity_est = propensity_est,
-                        lambda = lambda, 
+                        lambda = lambda,
                         smoothers = smoothers,
                         cumint_smoothers = cumint_smoothers,
                         trt_bounds = trt_bounds,
-                        threshold_val = threshold_val, 
-                        kernel_bw= kernel_bw, 
+                        threshold_val = threshold_val,
+                        kernel_bw= kernel_bw,
                         clip_epsilon = clip_epsilon,
                         clip_epsilon_bar = clip_epsilon_bar,
                         surrogate_type = "Gaussian",
                         loss_type = "db",
                         method = "L-BFGS-B",
-                        control = list(maxit =300, trace = 3))
+                        control = list(maxit = optim_maxit, trace = optim_trace))
     
     params <- sub_result$par
     
@@ -592,7 +614,8 @@ calculate_acc_mcc <- function(T, Y, policy, threshold_val){
 
 calculate_acc_mcc_two_sided_f1 <- function(T, Y, policy, threshold_val){
   acc <- Metrics::accuracy(Y > threshold_val, policy  > T )
-  mcc <- yardstick::mcc_vec(truth = as.factor(Y > threshold_val), estimate = as.factor(policy  > T))
+  mcc <- yardstick::mcc_vec(truth    = factor(Y      > threshold_val, levels = c(FALSE, TRUE)),
+                             estimate = factor(policy > T,             levels = c(FALSE, TRUE)))
   
   
   score_pos <- Metrics::f1(Y > threshold_val, policy  > T)
@@ -614,7 +637,8 @@ calculate_acc_mcc_two_sided_f1 <- function(T, Y, policy, threshold_val){
 
 print_acc_mcc_two_sided_f1 <- function(T, Y, policy, threshold_val){
   acc <- Metrics::accuracy(Y > threshold_val, policy  > T )
-  mcc <- yardstick::mcc_vec(truth = as.factor(Y > threshold_val), estimate = as.factor(policy  > T))
+  mcc <- yardstick::mcc_vec(truth    = factor(Y      > threshold_val, levels = c(FALSE, TRUE)),
+                             estimate = factor(policy > T,             levels = c(FALSE, TRUE)))
   
   
   score_pos <- Metrics::f1(Y > threshold_val, policy  > T)

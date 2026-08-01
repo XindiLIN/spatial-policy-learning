@@ -122,7 +122,7 @@ plss_covariates_sf_combine$drainagecl = factor(plss_covariates_sf_combine$draina
 p_drainage <- ggplot() +
   geom_sf(data = counties,color = 'black', size = 0.2,fill = 'lightgrey') +
   geom_sf(data = plss_covariates_sf_combine, aes(color=drainagecl), size = 0.05) +
-  scale_color_brewer(palette = "magma", name = "Soil Drainage Level",
+  scale_color_brewer(palette = "Greens", name = "Soil Drainage Level",
                      labels = c(
                        "Very poorly drained" = "Very poor",  # Custom label
                        "Poorly drained" = "Poorly",                  # Custom label
