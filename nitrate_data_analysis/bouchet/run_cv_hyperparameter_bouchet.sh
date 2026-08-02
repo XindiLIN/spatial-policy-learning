@@ -23,17 +23,21 @@ cd "$SLURM_SUBMIT_DIR"
 module reset
 module load R/4.4.2-gfbf-2024a
 
-# OPENBLAS-OPENMP is already this R module's default FlexiBLAS backend
-# (confirmed via `flexiblas current`/sessionInfo() -- NETLIB is available but
-# not the default), so this export is just for explicitness/reproducibility,
-# not a fix by itself. The actual fix is OMP_NUM_THREADS=1: OpenBLAS
-# multithreads internally by default, and cv_hyperparameter.R separately
-# parallelizes across many forked R processes via mclapply (both across areas
-# and across (area, m, combo) tasks) -- without this, each of those processes
-# would ALSO try to spawn multiple OpenBLAS threads, oversubscribing the core
-# allocation (N workers x M BLAS threads each) rather than speeding anything up.
-export FLEXIBLAS=OPENBLAS-OPENMP
+# OPENBLAS is already this R module's default FlexiBLAS backend (confirmed
+# via sessionInfo() -- NETLIB is available but not the default), so this
+# export is just for explicitness/reproducibility, not a fix by itself. Note
+# the name is "OPENBLAS", not "OPENBLAS-OPENMP" -- `flexiblas list` displays
+# the latter (matching its library filename), but that's not the name the
+# FLEXIBLAS env var actually accepts; using it silently fell back to the
+# (identical, correct) default with a warning on stderr. The actual fix is
+# OMP_NUM_THREADS=1: OpenBLAS multithreads internally by default, and
+# cv_hyperparameter.R separately parallelizes across many forked R processes
+# via mclapply (both across areas and across (area, m, combo) tasks) --
+# without this, each of those processes would ALSO try to spawn multiple
+# OpenBLAS threads, oversubscribing the core allocation (N workers x M BLAS
+# threads each) rather than speeding anything up.
+export FLEXIBLAS=OPENBLAS
 export OMP_NUM_THREADS=1
-echo "FlexiBLAS backend in use: $(flexiblas current)"
+Rscript -e 'writeLines(grep("BLAS", capture.output(sessionInfo()), value = TRUE))'
 
 Rscript nitrate_data_analysis/cv_hyperparameter.R
