@@ -28,4 +28,17 @@ cd "$SLURM_SUBMIT_DIR"
 
 module reset
 module load R/4.4.2-gfbf-2024a
+
+# The gfbf toolchain's FlexiBLAS defaults to the unoptimized, single-threaded
+# NETLIB backend unless told otherwise -- `flexiblas list` shows OPENBLAS-OPENMP
+# is also available, which is dramatically faster for the matrix-heavy
+# kernelMatrix()/glmnet()/optim() calls this script relies on. OMP_NUM_THREADS=1
+# is set alongside it because cv_hyperparameter.R already parallelizes across up
+# to `-c` forked R processes via mclapply -- letting OpenBLAS ALSO multithread
+# inside each of those processes would oversubscribe the core allocation
+# (N workers x M BLAS threads each) rather than speed anything up.
+export FLEXIBLAS=OPENBLAS-OPENMP
+export OMP_NUM_THREADS=1
+echo "FlexiBLAS backend in use: $(flexiblas current)"
+
 Rscript nitrate_data_analysis/cv_hyperparameter.R
