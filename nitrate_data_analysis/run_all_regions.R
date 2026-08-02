@@ -80,10 +80,17 @@ plss_crop_exclude <- list(
 output_dir <- "nitrate_data_analysis/output"
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
-# Bump this when running on Bouchet; kept conservative for a local run.
+# Parallelizes the per-observation DC warm start (piece iii). On a SLURM
+# cluster (e.g. Yale's Bouchet), detectCores() reports the whole node's core
+# count, not what the job was actually allocated -- read SLURM's own env var
+# when present, and only fall back to detectCores() - 1 for local/laptop runs
+# outside SLURM (matches cv_hyperparameter.R's mc.cores pattern). Safe to use
+# the full allocation here since regions are processed sequentially, not
+# concurrently -- see the main loop below.
 # (Hyperparameter CV (piece v) is no longer run from here -- see
 # run_region_pipeline() below -- so there's no cv_mc.cores anymore.)
-init_mc.cores <- 1  # parallelizes the per-observation DC warm start (piece iii)
+init_mc.cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = NA))
+if (is.na(init_mc.cores)) init_mc.cores <- max(1, parallel::detectCores() - 1)
 
 use_cache <- TRUE  # reuse cached outcome_reg / smoothers / CV / region results
 
