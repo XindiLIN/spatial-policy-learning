@@ -19,8 +19,8 @@
 #     region_pipeline_funcs.R); hyperparameter CV must already be cached
 #     there too, by cv_hyperparameter.R, before this script is run
 #   - this driver additionally caches each region's FULL result to
-#     `output_dir/region_result_<area_key>.rds`, so a rerun after an
-#     interruption skips regions that already finished
+#     `output_dir/area_results/region_result_<area_key>.rds`, so a rerun
+#     after an interruption skips regions that already finished
 # ============================================================
 
 source("nitrate_data_analysis/region_pipeline_funcs.R")
@@ -79,6 +79,16 @@ plss_crop_exclude <- list(
 
 output_dir <- "nitrate_data_analysis/output"
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Final per-region results and the combined cross-region outputs go in their
+# own subfolder, separate from output_dir's CV artifacts (cv_results_*.rds,
+# cv_partial/) and the piece (i)/(iii) caches (outcome_regression_*.rds,
+# smoothers_*.rds, direct_init_*.rds) -- those all stay directly under
+# output_dir since fit_region_base()/prep_direct_method_inputs() and the CV
+# results lookup below must keep reading from the same location
+# cv_hyperparameter.R already wrote them to.
+region_results_dir <- file.path(output_dir, "area_results")
+dir.create(region_results_dir, recursive = TRUE, showWarnings = FALSE)
 
 # Parallelizes the per-observation DC warm start (piece iii). On a SLURM
 # cluster (e.g. Yale's Bouchet), detectCores() reports the whole node's core
@@ -221,7 +231,7 @@ region_results <- list()
 
 for (area in areas) {
   area_key <- area_key_map[[area]]
-  result_path <- file.path(output_dir, sprintf("region_result_%s.rds", area_key))
+  result_path <- file.path(region_results_dir, sprintf("region_result_%s.rds", area_key))
 
   if (use_cache && file.exists(result_path)) {
     cat(sprintf("Loading cached region result for %s...\n", area))
@@ -248,9 +258,9 @@ for (area in areas) {
 plss_sf_combine_direct <- do.call(rbind, lapply(region_results, `[[`, "plss_sf_direct"))
 plss_sf_combine_indirect_nonspatial <- do.call(rbind, lapply(region_results, `[[`, "plss_sf_indirect"))
 
-saveRDS(plss_sf_combine_direct, file.path(output_dir, "plss_sf_combine_direct.rds"))
+saveRDS(plss_sf_combine_direct, file.path(region_results_dir, "plss_sf_combine_direct.rds"))
 saveRDS(plss_sf_combine_indirect_nonspatial,
-        file.path(output_dir, "plss_sf_combine_indirect_nonspatial.rds"))
+        file.path(region_results_dir, "plss_sf_combine_indirect_nonspatial.rds"))
 
 # Summary table: chosen hyperparameters + train/test metrics per region,
 # for a quick sanity check before handing off to policy_visualization.r
@@ -264,7 +274,7 @@ summary_df <- do.call(rbind, lapply(region_results, function(r) {
   )
 }))
 rownames(summary_df) <- NULL
-saveRDS(summary_df, file.path(output_dir, "region_pipeline_summary.rds"))
+saveRDS(summary_df, file.path(region_results_dir, "region_pipeline_summary.rds"))
 print(summary_df)
 
 
