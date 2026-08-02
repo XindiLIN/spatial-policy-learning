@@ -509,6 +509,71 @@ fit_one_fold_direct <- function(k_train, k_holdout, data_fold_train, T_holdout, 
                                   threshold_val = threshold_val)
 }
 
+# Builds the raw (no intercept) Gram matrix for one bandwidth exponent `m`.
+# Reused across every (lambda, kernel_bw_mult) combo and every fold for that
+# m, since it doesn't depend on either -- the "build once per m" optimization
+# referenced throughout this file. Pulled out on its own so cv_hyperparameter.R
+# can build it once per (area, m) up front and share it (via mclapply's
+# copy-on-write) across many combo-level parallel tasks.
+build_kraw_for_m <- function(m, kernel_design_matrix) {
+  gamma <- 2^m * median(fields::rdist(kernel_design_matrix))
+  rbf   <- rbfdot(sigma = 1 / (gamma^2))
+  kernelMatrix(rbf, kernel_design_matrix)  # n_train x n_train, no intercept yet
+}
+
+# Runs one (lambda, kernel_bw_mult) combo's full k-fold CV (all n_folds fits),
+# given a precomputed k_raw for this m. This is the unit of work parallelized
+# by cv_hyperparameter.R's flat (area, m, combo) task grid -- pulled out as
+# its own function, rather than inlined in a loop, so it can be called either
+# sequentially (cv_hyperparam_group_for_m, below) or as one mclapply task.
+cv_fit_one_combo <- function(lambda, kernel_bw_mult, kernel_bw_baseline, k_raw,
+                              data_train, fold_id, n_folds, threshold_val, depth_range,
+                              clip_epsilon = 30, krige_values, weights, outcome_resid,
+                              smoothers_RKHS, cumint_smoothers_RKHS, maxit = 350) {
+
+  kernel_bw <- kernel_bw_mult * kernel_bw_baseline
+
+  fold_metrics <- vector("list", n_folds)
+  for (f in seq_len(n_folds)) {
+    train_idx   <- which(fold_id != f)
+    holdout_idx <- which(fold_id == f)
+
+    k_train   <- cbind(1, k_raw[train_idx, train_idx, drop = FALSE])
+    k_holdout <- cbind(1, k_raw[holdout_idx, train_idx, drop = FALSE])
+
+    fold_metrics[[f]] <- fit_one_fold_direct(
+      k_train = k_train, k_holdout = k_holdout,
+      data_fold_train = data_train[train_idx, ],
+      T_holdout = data_train$logWellDepth[holdout_idx],
+      Y_holdout = data_train$logconcentration_plus_median[holdout_idx],
+      krige_ft = krige_values[train_idx], weights_ft = weights[train_idx],
+      resid_ft = outcome_resid[train_idx],
+      smoothers_ft = smoothers_RKHS[train_idx], cumint_smoothers_ft = cumint_smoothers_RKHS[train_idx],
+      lambda = lambda, kernel_bw = kernel_bw, threshold_val = threshold_val,
+      depth_range = depth_range, clip_epsilon = clip_epsilon, maxit = maxit
+    )
+  }
+
+  # na.rm = TRUE: mcc (and, more rarely, acc/f1) can be genuinely undefined
+  # for a single fold if that fold's held-out predictions collapse to one
+  # class (e.g. severe class imbalance with a small fold) -- see
+  # calculate_acc_mcc_two_sided_f1()'s explicit factor(levels=c(FALSE,TRUE))
+  # guard, which now returns NA for that fold instead of erroring. One
+  # degenerate fold shouldn't zero out this whole combo's score.
+  fold_mcc <- vapply(fold_metrics, `[[`, numeric(1), "mcc")
+  data.frame(
+    lambda = lambda, kernel_bw_mult = kernel_bw_mult, kernel_bw = kernel_bw,
+    acc          = mean(vapply(fold_metrics, `[[`, numeric(1), "acc"), na.rm = TRUE),
+    mcc          = mean(fold_mcc, na.rm = TRUE),
+    two_sided_f1 = mean(vapply(fold_metrics, `[[`, numeric(1), "two_sided_f1"), na.rm = TRUE),
+    n_na_folds   = sum(is.na(fold_mcc))
+  )
+}
+
+# Sequential per-m CV grid (all combos for one m, one after another). Used by
+# choose_direct_hyperparameters_cv() (which parallelizes across m instead) and
+# the Rmd smoke test. cv_hyperparameter.R calls cv_fit_one_combo() directly
+# instead, for finer-grained (area, m, combo) parallelism.
 cv_hyperparam_group_for_m <- function(m, lambda_lst, kernel_bw_mult_lst, data_train, kernel_design_matrix,
                                        kernel_bw_baseline, fold_id, n_folds = 5,
                                        threshold_val, depth_range, clip_epsilon = 30,
@@ -516,62 +581,36 @@ cv_hyperparam_group_for_m <- function(m, lambda_lst, kernel_bw_mult_lst, data_tr
                                        smoothers_RKHS, cumint_smoothers_RKHS,
                                        progress_label = NULL, maxit = 350) {
 
-  gamma <- 2^m * median(fields::rdist(kernel_design_matrix))
-  rbf   <- rbfdot(sigma = 1 / (gamma^2))
-  k_raw <- kernelMatrix(rbf, kernel_design_matrix)  # n_train x n_train, no intercept yet
+  k_raw <- build_kraw_for_m(m, kernel_design_matrix)
+  grid  <- expand.grid(lambda = lambda_lst, kernel_bw_mult = kernel_bw_mult_lst)
 
-  grid <- expand.grid(lambda = lambda_lst, kernel_bw_mult = kernel_bw_mult_lst)
-  grid$acc <- NA_real_; grid$mcc <- NA_real_; grid$two_sided_f1 <- NA_real_
-
+  rows <- vector("list", nrow(grid))
   for (g in seq_len(nrow(grid))) {
-
-    lambda    <- grid$lambda[g]
-    kernel_bw <- grid$kernel_bw_mult[g] * kernel_bw_baseline
-
-    fold_metrics <- vector("list", n_folds)
-    for (f in seq_len(n_folds)) {
-      train_idx   <- which(fold_id != f)
-      holdout_idx <- which(fold_id == f)
-
-      k_train   <- cbind(1, k_raw[train_idx, train_idx, drop = FALSE])
-      k_holdout <- cbind(1, k_raw[holdout_idx, train_idx, drop = FALSE])
-
-      fold_metrics[[f]] <- fit_one_fold_direct(
-        k_train = k_train, k_holdout = k_holdout,
-        data_fold_train = data_train[train_idx, ],
-        T_holdout = data_train$logWellDepth[holdout_idx],
-        Y_holdout = data_train$logconcentration_plus_median[holdout_idx],
-        krige_ft = krige_values[train_idx], weights_ft = weights[train_idx],
-        resid_ft = outcome_resid[train_idx],
-        smoothers_ft = smoothers_RKHS[train_idx], cumint_smoothers_ft = cumint_smoothers_RKHS[train_idx],
-        lambda = lambda, kernel_bw = kernel_bw, threshold_val = threshold_val,
-        depth_range = depth_range, clip_epsilon = clip_epsilon, maxit = maxit
-      )
-    }
-
-    # na.rm = TRUE: mcc (and, more rarely, acc/f1) can be genuinely undefined
-    # for a single fold if that fold's held-out predictions collapse to one
-    # class (e.g. severe class imbalance with a small fold) -- see
-    # calculate_acc_mcc_two_sided_f1()'s explicit factor(levels=c(FALSE,TRUE))
-    # guard, which now returns NA for that fold instead of erroring. One
-    # degenerate fold shouldn't zero out this whole combo's score.
-    fold_mcc <- vapply(fold_metrics, `[[`, numeric(1), "mcc")
-    grid$acc[g]          <- mean(vapply(fold_metrics, `[[`, numeric(1), "acc"), na.rm = TRUE)
-    grid$mcc[g]           <- mean(fold_mcc, na.rm = TRUE)
-    grid$two_sided_f1[g] <- mean(vapply(fold_metrics, `[[`, numeric(1), "two_sided_f1"), na.rm = TRUE)
+    rows[[g]] <- cv_fit_one_combo(
+      lambda = grid$lambda[g], kernel_bw_mult = grid$kernel_bw_mult[g],
+      kernel_bw_baseline = kernel_bw_baseline, k_raw = k_raw,
+      data_train = data_train, fold_id = fold_id, n_folds = n_folds,
+      threshold_val = threshold_val, depth_range = depth_range, clip_epsilon = clip_epsilon,
+      krige_values = krige_values, weights = weights, outcome_resid = outcome_resid,
+      smoothers_RKHS = smoothers_RKHS, cumint_smoothers_RKHS = cumint_smoothers_RKHS, maxit = maxit
+    )
 
     if (!is.null(progress_label)) {
-      n_na_folds <- sum(is.na(fold_mcc))
-      na_note <- if (n_na_folds > 0) sprintf("  [%d/%d folds had undefined mcc]", n_na_folds, n_folds) else ""
+      r <- rows[[g]]
+      na_note <- if (r$n_na_folds > 0) sprintf("  [%d/%d folds had undefined mcc]", r$n_na_folds, n_folds) else ""
       cat(sprintf("%s: combo %d/%d done (lambda=%.2f, kernel_bw_mult=%.2f) -> acc=%.4f mcc=%.4f f1=%.4f%s\n",
-                  progress_label, g, nrow(grid), lambda, grid$kernel_bw_mult[g],
-                  grid$acc[g], grid$mcc[g], grid$two_sided_f1[g], na_note))
+                  progress_label, g, nrow(grid), r$lambda, r$kernel_bw_mult, r$acc, r$mcc, r$two_sided_f1, na_note))
+      # Without an explicit flush, stdout from mclapply's forked workers sits in each
+      # worker's own buffer (block-buffered when redirected to a file, e.g. a SLURM
+      # .out log) until it fills or the worker exits -- flushing here makes progress
+      # show up live instead of arriving in one big burst at the end.
+      flush(stdout())
     }
   }
 
-  grid$m         <- m
-  grid$kernel_bw <- grid$kernel_bw_mult * kernel_bw_baseline
-  grid[, c("m", "lambda", "kernel_bw_mult", "kernel_bw", "acc", "mcc", "two_sided_f1")]
+  out   <- dplyr::bind_rows(rows)
+  out$m <- m
+  out[, c("m", "lambda", "kernel_bw_mult", "kernel_bw", "acc", "mcc", "two_sided_f1")]
 }
 
 # Top-level CV driver for one region. `region_base` and `kdm_info` come

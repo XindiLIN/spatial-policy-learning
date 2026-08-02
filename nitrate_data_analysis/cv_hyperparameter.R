@@ -106,61 +106,85 @@ names(area_ctxs) <- cv_areas
 
 
 # ============================================================
-# CHECKPOINTED, RETRYABLE CV — one task per (area, m)
+# CHECKPOINTED, RETRYABLE CV — one task per (area, m, combo)
 # ============================================================
+# Parallelized at combo granularity, not just per (area, m), so the full
+# mc.cores allocation actually gets used even with few areas/m-values -- e.g.
+# 1 area x 6 m-values x 20 combos = 120 tasks, vs only 6 concurrent tasks (and
+# most of a 16-core allocation sitting idle) if parallelized at the (area, m)
+# level. This also gives much finer-grained checkpointing/resumability: a
+# killed run loses at most one combo's worth of work, not a whole (area, m)'s.
 
-n_combos <- length(lambda_grid) * length(bw_mult_grid)
+combo_grid <- expand.grid(lambda = lambda_grid, kernel_bw_mult = bw_mult_grid, stringsAsFactors = FALSE)
+n_combos   <- nrow(combo_grid)
 cat(sprintf(
-  "\nCV for %d area(s) x %d m-values, threshold=log(%g)\n%d combos x %d folds = %d optim runs per (area, m)\n\n",
-  length(cv_areas), length(m_grid), round(exp(cv_threshold)), n_combos, cv_folds, n_combos * cv_folds
+  "\nCV for %d area(s) x %d m-values x %d combos, threshold=log(%g)\n%d total (area, m, combo) tasks x %d folds = %d optim runs\n\n",
+  length(cv_areas), length(m_grid), n_combos, round(exp(cv_threshold)),
+  length(cv_areas) * length(m_grid) * n_combos, cv_folds,
+  length(cv_areas) * length(m_grid) * n_combos * cv_folds
 ))
+
+# k_raw depends only on (area, m), not on the combo -- build it once per
+# (area, m) up front (cheap, sequential) so every combo task for that (area,
+# m) can reuse it. Built here in the parent process before any forking, so
+# mclapply's copy-on-write lets workers share it read-only without
+# recomputing or duplicating it in memory.
+kraw_by_area_m <- lapply(area_ctxs, function(ctx) {
+  setNames(lapply(m_grid, function(m) build_kraw_for_m(m, ctx$kdm_info$kdm)), as.character(m_grid))
+})
 
 cv_partial_dir <- file.path(output_dir, "cv_partial")
 dir.create(cv_partial_dir, recursive = TRUE, showWarnings = FALSE)
 
-cv_partial_path <- function(area_key, m) {
-  file.path(cv_partial_dir, sprintf("%s_%s_m%s.rds", area_key, threshold_label, gsub("-", "neg", sprintf("%.2f", m))))
+cv_partial_path <- function(area_key, m, combo_idx) {
+  file.path(cv_partial_dir, sprintf("%s_%s_m%s_c%03d.rds",
+            area_key, threshold_label, gsub("-", "neg", sprintf("%.2f", m)), combo_idx))
 }
 
-cv_task_grid <- expand.grid(cv_area = cv_areas, m = m_grid, stringsAsFactors = FALSE)
+cv_task_grid <- expand.grid(cv_area = cv_areas, m = m_grid, combo_idx = seq_len(n_combos), stringsAsFactors = FALSE)
 
-run_one_cv_group <- function(cv_area, m) {
-  ctx   <- area_ctxs[[cv_area]]
-  label <- sprintf("area=%s | m=%.2f", cv_area, m)
-  cat(sprintf("%s: starting (%d combos x %d folds = %d fits)\n", label, n_combos, cv_folds, n_combos * cv_folds))
+run_one_cv_task <- function(cv_area, m, combo_idx) {
+  ctx            <- area_ctxs[[cv_area]]
+  lambda         <- combo_grid$lambda[combo_idx]
+  kernel_bw_mult <- combo_grid$kernel_bw_mult[combo_idx]
+  label <- sprintf("area=%s | m=%.2f | combo %d/%d (lambda=%.2f, kernel_bw_mult=%.2f)",
+                    cv_area, m, combo_idx, n_combos, lambda, kernel_bw_mult)
 
-  result <- cv_hyperparam_group_for_m(
-    m = m, lambda_lst = lambda_grid, kernel_bw_mult_lst = bw_mult_grid,
-    data_train = ctx$data_split$data, kernel_design_matrix = ctx$kdm_info$kdm,
+  result <- cv_fit_one_combo(
+    lambda = lambda, kernel_bw_mult = kernel_bw_mult,
     kernel_bw_baseline = ctx$region_base$kernel_bw_silverman,
-    fold_id = ctx$fold_id, n_folds = cv_folds,
+    k_raw = kraw_by_area_m[[cv_area]][[as.character(m)]],
+    data_train = ctx$data_split$data, fold_id = ctx$fold_id, n_folds = cv_folds,
     threshold_val = cv_threshold, depth_range = ctx$region_base$depth_range,
     krige_values = ctx$region_base$outcome_reg$krige_values,
     weights = ctx$region_base$weights_cbps$weights,
     outcome_resid = ctx$outcome_resid,
     smoothers_RKHS = ctx$region_base$smoothers$smoothers_RKHS,
     cumint_smoothers_RKHS = ctx$region_base$smoothers$cumint_smoothers_RKHS,
-    progress_label = label, maxit = optim_maxit_cv
+    maxit = optim_maxit_cv
   )
+  result$m        <- m
   result$cv_area  <- cv_area
   result$area_key <- ctx$area_key
 
-  # Incremental checkpoint: each (area, m) task writes its own result to
-  # disk the moment it finishes, rather than only after the whole mclapply
+  # Incremental checkpoint: each (area, m, combo) task writes its own result
+  # to disk the moment it finishes, rather than only after the whole mclapply
   # call returns -- if a later task crashes/OOMs, this one's result is
   # already safely on disk.
-  saveRDS(result, file = cv_partial_path(ctx$area_key, m))
-  cat(sprintf("%s: finished\n", label))
+  saveRDS(result, file = cv_partial_path(ctx$area_key, m, combo_idx))
+  na_note <- if (result$n_na_folds > 0) sprintf("  [%d/%d folds had undefined mcc]", result$n_na_folds, cv_folds) else ""
+  cat(sprintf("%s: done -> acc=%.4f mcc=%.4f f1=%.4f%s\n", label, result$acc, result$mcc, result$two_sided_f1, na_note))
+  flush(stdout())
   result
 }
 
-# Skip any (area, m) task that already has a checkpoint file from a
+# Skip any (area, m, combo) task that already has a checkpoint file from a
 # previous run (e.g. one that got OOM-killed partway through), and retry
 # whatever's still missing in a loop -- each retry only tackles the
 # shrinking set of missing tasks, re-checking cv_partial/ after every pass.
 for (attempt in seq_len(max_cv_attempts)) {
   area_keys_for_task <- area_key_map[cv_task_grid$cv_area]
-  already_done <- file.exists(cv_partial_path(area_keys_for_task, cv_task_grid$m))
+  already_done <- file.exists(cv_partial_path(area_keys_for_task, cv_task_grid$m, cv_task_grid$combo_idx))
   todo_grid <- cv_task_grid[!already_done, , drop = FALSE]
 
   if (nrow(todo_grid) == 0) {
@@ -175,7 +199,7 @@ for (attempt in seq_len(max_cv_attempts)) {
   # forked worker gets OOM-killed by the OS -- the missing-task check
   # below catches that case, not just R-level errors caught via try().
   parallel::mclapply(seq_len(nrow(todo_grid)), function(k) {
-    run_one_cv_group(todo_grid$cv_area[k], todo_grid$m[k])
+    run_one_cv_task(todo_grid$cv_area[k], todo_grid$m[k], todo_grid$combo_idx[k])
   }, mc.cores = min(nrow(todo_grid), mc.cores))
 }
 
@@ -185,13 +209,14 @@ for (attempt in seq_len(max_cv_attempts)) {
 # on the remaining tasks.
 area_keys_for_task <- area_key_map[cv_task_grid$cv_area]
 cv_task_results <- lapply(seq_len(nrow(cv_task_grid)), function(k) {
-  path <- cv_partial_path(area_keys_for_task[k], cv_task_grid$m[k])
+  path <- cv_partial_path(area_keys_for_task[k], cv_task_grid$m[k], cv_task_grid$combo_idx[k])
   if (file.exists(path)) readRDS(path) else NULL
 })
 
 missing <- vapply(cv_task_results, function(x) is.null(x) || inherits(x, "try-error"), logical(1))
 if (any(missing)) {
-  missing_desc <- sprintf("area=%s, m=%.2f", cv_task_grid$cv_area[missing], cv_task_grid$m[missing])
+  missing_desc <- sprintf("area=%s, m=%.2f, combo=%d",
+                           cv_task_grid$cv_area[missing], cv_task_grid$m[missing], cv_task_grid$combo_idx[missing])
   cat(sprintf("\nWARNING: %d of %d CV task(s) are still missing after %d attempt(s):\n%s\n",
               sum(missing), nrow(cv_task_grid), max_cv_attempts, paste(missing_desc, collapse = "\n")))
   cat("Re-run this script to retry just the missing tasks (already-completed ones will be skipped).\n\n")
