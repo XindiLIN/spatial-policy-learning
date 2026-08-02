@@ -6,15 +6,18 @@
 # (direct method + non-spatial indirect method).
 #
 # Two things live here:
-#   run_region_pipeline(area, ...) -- runs pieces (i)-(v) for ONE
-#     region, in order, and returns everything needed for the map.
+#   run_region_pipeline(area, ...) -- runs pieces (i)-(iv) for ONE region (in
+#     order, loading piece (v)'s hyperparameters from cv_hyperparameter.R's
+#     output rather than computing them here -- see that function's cv_path
+#     comment) and returns everything needed for the map.
 #   The main loop below applies it to every region and rbinds the
 #     per-region sf outputs into the combined map layers.
 #
-# Each region's run is itself expensive (SVM+kriging, hyperparameter
-# CV, per-observation DC warm start), so:
-#   - fit_region_base() and choose_direct_hyperparameters_cv() cache
-#     their (slow) results to `output_dir` (see region_pipeline_funcs.R)
+# Each region's run is itself expensive (SVM+kriging, per-observation DC warm
+# start), so:
+#   - fit_region_base() caches its (slow) results to `output_dir` (see
+#     region_pipeline_funcs.R); hyperparameter CV must already be cached
+#     there too, by cv_hyperparameter.R, before this script is run
 #   - this driver additionally caches each region's FULL result to
 #     `output_dir/region_result_<area_key>.rds`, so a rerun after an
 #     interruption skips regions that already finished
@@ -52,14 +55,6 @@ area_key_map <- c(
 threshold_val <- log(5)
 year_filter   <- 2020
 
-# Hyperparameter CV grid (matches nitrate_data_analysis/cv_hyperparameter.R's
-# established defaults)
-m_lst              <- c(-3, -2, -1.5, -1, 0, 0.5)
-lambda_lst         <- c(0.1, 0.25, 0.5, 1.0)
-kernel_bw_mult_lst <- c(0.5, 1, 2, 5, 10)
-n_folds            <- 5
-cv_seed            <- 42
-
 # Explicit county lists for PLSS sub-setting; NULL means use the counties
 # actually observed in that region's training wells
 plss_county_override <- list(
@@ -85,8 +80,9 @@ plss_crop_exclude <- list(
 output_dir <- "nitrate_data_analysis/output"
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
-# Bump these when running on Bouchet; kept conservative for a local run.
-cv_mc.cores   <- 1  # parallelizes across `m` values inside CV (piece v)
+# Bump this when running on Bouchet; kept conservative for a local run.
+# (Hyperparameter CV (piece v) is no longer run from here -- see
+# run_region_pipeline() below -- so there's no cv_mc.cores anymore.)
 init_mc.cores <- 1  # parallelizes the per-observation DC warm start (piece iii)
 
 use_cache <- TRUE  # reuse cached outcome_reg / smoothers / CV / region results
@@ -110,11 +106,9 @@ plss_covariates_all <- read.csv("data/plss_covariates.csv")
 run_region_pipeline <- function(area,
                                  data_all, plss_covariates_all, output_dir,
                                  threshold_val,
-                                 m_lst, lambda_lst, kernel_bw_mult_lst,
                                  plss_county_override = NULL, plss_crop_exclude = NULL,
                                  RKHS_covariate_names = RKHS_COVARIATE_NAMES_DEFAULT,
-                                 n_folds = 5, cv_seed = 42,
-                                 cv_mc.cores = 1, init_mc.cores = 1,
+                                 init_mc.cores = 1,
                                  use_cache = TRUE) {
 
   area_key <- area_key_map[[area]]
@@ -140,20 +134,28 @@ run_region_pipeline <- function(area,
     RKHS_covariate_names = RKHS_covariate_names
   )
 
-  # (v) hyperparameter selection via 5-fold CV
-  cv_path <- file.path(output_dir, sprintf("cv_results_%s.rds", area_key))
-  if (use_cache && file.exists(cv_path)) {
-    cat("Loading cached CV results...\n")
-    cv_results <- readRDS(cv_path)
-  } else {
-    cat("Running hyperparameter CV...\n")
-    cv_results <- choose_direct_hyperparameters_cv(
-      data_split = data_split, region_base = region_base, kdm_info = kdm_info,
-      m_lst = m_lst, lambda_lst = lambda_lst, kernel_bw_mult_lst = kernel_bw_mult_lst,
-      threshold_val = threshold_val, n_folds = n_folds, seed_value = cv_seed,
-      mc.cores = cv_mc.cores
-    )
-    saveRDS(cv_results, cv_path)
+  # (v) hyperparameter selection -- REQUIRES cv_hyperparameter.R to already
+  # have been run for this area. There is deliberately no in-line fallback
+  # to compute CV here: an earlier version of this file built the cache path
+  # without the threshold-label suffix that cv_hyperparameter.R actually
+  # uses (cv_results_<area_key>.rds vs. the real cv_results_<area_key>_<label>.rds),
+  # so file.exists() always missed and silently recomputed CV from scratch
+  # with the older, unparallelized choose_direct_hyperparameters_cv() path --
+  # slow, and a second CV implementation that can drift out of sync with the
+  # first. Failing loudly here instead keeps there being exactly one way to
+  # compute CV results.
+  threshold_label <- paste0("log", round(exp(threshold_val), 0))
+  cv_path <- file.path(output_dir, sprintf("cv_results_%s_%s.rds", area_key, threshold_label))
+  if (!file.exists(cv_path)) {
+    stop(sprintf(
+      "run_region_pipeline(): no CV results found for %s at %s. Run cv_hyperparameter.R for this area first (add \"%s\" to its cv_areas).",
+      area, cv_path, area
+    ))
+  }
+  cat("Loading CV results...\n")
+  cv_results <- readRDS(cv_path)
+  if (all(is.na(cv_results$mcc) | is.nan(cv_results$mcc))) {
+    stop(sprintf("run_region_pipeline(): every combo's mcc in %s is NA/undefined.", cv_path))
   }
   best <- cv_results[which.max(cv_results$mcc), ]
   cat(sprintf("Best CV hyperparameters: m=%.1f  lambda=%.2f  kernel_bw_mult=%.1f  (CV mcc=%.4f)\n",
@@ -202,9 +204,9 @@ run_region_pipeline <- function(area,
 # ============================================================
 # MAIN LOOP -- apply the pipeline to every region
 # ============================================================
-# Sequential across regions (each region already parallelizes
-# internally via cv_mc.cores/init_mc.cores); nesting mclapply at both
-# levels would oversubscribe cores. Each region's full result is
+# Sequential across regions (each region already parallelizes internally
+# via init_mc.cores for piece (iii)'s DC warm start); nesting mclapply at
+# both levels would oversubscribe cores. Each region's full result is
 # cached, so re-running this script after an interruption picks up
 # where it left off.
 
@@ -224,10 +226,8 @@ for (area in areas) {
     area = area,
     data_all = data_all, plss_covariates_all = plss_covariates_all, output_dir = output_dir,
     threshold_val = threshold_val,
-    m_lst = m_lst, lambda_lst = lambda_lst, kernel_bw_mult_lst = kernel_bw_mult_lst,
     plss_county_override = plss_county_override, plss_crop_exclude = plss_crop_exclude,
-    n_folds = n_folds, cv_seed = cv_seed,
-    cv_mc.cores = cv_mc.cores, init_mc.cores = init_mc.cores,
+    init_mc.cores = init_mc.cores,
     use_cache = use_cache
   )
   saveRDS(region_results[[area]], result_path)
