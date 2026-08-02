@@ -36,7 +36,8 @@ library(ggplot2)
 # CONFIGURATION  — edit only this section
 # ============================================================
 
-cv_areas       <- c("North East")  # start with one; add more areas to this vector later
+cv_areas       <- c("Central", "Northwest", "North East", "North Central", "West Central",
+                     "East Central", "South West", "South Central", "South East")
 cv_threshold   <- log(5)           # e.g. log(2), log(5), log(10)
 cv_seed        <- 42               # fixed seed for fold assignment
 cv_folds       <- 5                # number of CV folds
