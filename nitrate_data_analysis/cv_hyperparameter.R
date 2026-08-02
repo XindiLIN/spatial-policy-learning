@@ -85,9 +85,18 @@ data_all <- load_nitrate_data(file_path = "data/data_Nitrate_with_covar.csv", ze
 if (!is.null(year_filter)) data_all <- data_all[data_all$SampleYear >= year_filter, ]
 
 # fit_region_base()/build_kernel_design_matrix() are already cached per
-# area_key by output_dir, so re-running this script for an area already
-# set up here is fast regardless of the checkpointing below.
-area_ctxs <- lapply(cv_areas, function(cv_area) {
+# area_key by output_dir, so re-running this script for an area already set up
+# here is fast regardless of the checkpointing below. Parallelized across
+# areas (each area's fit is independent -- different data, different
+# area_key-scoped cache files) rather than sequential, since with cv_areas
+# beyond one region this setup step was becoming the dominant, invisible-until-
+# done cost once the CV grid itself got fast: a fresh (uncached) fit_region_base()
+# takes ~15-20 min per area, and 9 areas run one at a time would add up to
+# hours before any CV work even started.
+area_ctxs <- parallel::mclapply(cv_areas, function(cv_area) {
+  cat(sprintf("Setting up area=%s (outcome regression + weights + smoothers)...\n", cv_area))
+  flush(stdout())
+
   area_key   <- area_key_map[[cv_area]]
   data_area  <- data_all[data_all$area == cv_area, ]
   data_split <- split_nitrate_data(data_area)
@@ -98,11 +107,22 @@ area_ctxs <- lapply(cv_areas, function(cv_area) {
   outcome_resid <- data_split$data$logconcentration_plus_median -
     region_base$outcome_reg$pred - region_base$outcome_reg$krige_values
 
+  cat(sprintf("Setup done for area=%s\n", cv_area))
+  flush(stdout())
+
   list(cv_area = cv_area, area_key = area_key, data_split = data_split,
        region_base = region_base, kdm_info = kdm_info,
        fold_id = fold_id, outcome_resid = outcome_resid)
-})
+}, mc.cores = min(length(cv_areas), mc.cores))
 names(area_ctxs) <- cv_areas
+
+setup_failed <- vapply(area_ctxs, function(x) is.null(x) || inherits(x, "try-error"), logical(1))
+if (any(setup_failed)) {
+  stop(sprintf("Area setup (fit_region_base/build_kernel_design_matrix) failed for: %s. ",
+               paste(cv_areas[setup_failed], collapse = ", ")),
+       "Check for OOM (mclapply returns NULL silently on an OOM-killed worker) or an R-level error above. ",
+       "Re-run the script -- fit_region_base() caches per area_key, so already-succeeded areas will load quickly.")
+}
 
 
 # ============================================================
