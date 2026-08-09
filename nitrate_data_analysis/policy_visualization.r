@@ -242,8 +242,13 @@ crop_marginal_plot <- ggplot(crop_marginal_combined_df, aes(x = crop_type_combin
   geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), linewidth = 0.8, width = 0.2, position = position_dodge(width = 0.4)) +
   # positions stay on the model's log scale, but labels are converted back to feet
   scale_y_continuous(labels = function(x) round(exp(x), 0)) +
-  # same land-use color scheme as dataset_visualization.R's p_land_use; land use is
-  # already shown on the x-axis, so its color legend is redundant and hidden
+  # numeric 1-6 codes (matching crop_order_marginal's order) so the
+  # ordering reads directly off the x-axis, alongside the color legend
+  scale_x_discrete(labels = as.character(seq_along(crop_order_marginal))) +
+  # same land-use color scheme as dataset_visualization.R's p_land_use; the
+  # legend labels carry the same 1-6 numbering as the x-axis (matching
+  # crop_order_marginal's order) so the correspondence lives in the legend,
+  # not spelled out again in the axis title
   scale_color_manual(
     values = c(
       "Forest" = "darkgreen",
@@ -255,8 +260,15 @@ crop_marginal_plot <- ggplot(crop_marginal_combined_df, aes(x = crop_type_combin
       "Cover Crop" = "brown",
       "Vegtables" = "purple"
     ),
+    labels = c(
+      "Corn" = "1 Corn",
+      "Soybeans" = "2 Soybeans",
+      "Grass" = "3 Grass",
+      "Vegtables" = "4 Vegetables",
+      "Developed" = "5 Developed",
+      "Forest" = "6 Forest"
+    ),
     name = "Land Use"
-    # guide = "none"
   ) +
   scale_shape_manual(values = c("Direct" = 16, "Non-spatial Indirect" = 17)) +
   labs(
@@ -271,8 +283,6 @@ crop_marginal_plot <- ggplot(crop_marginal_combined_df, aes(x = crop_type_combin
     axis.title.x = element_text(size = 15),
     axis.title.y = element_text(size = 15),
     axis.text = element_text(size = 13),
-    # axis.text.x = element_text(size = 18, angle = 45, hjust = 1),
-    axis.text.x = element_blank(),
     legend.title = element_text(size = 13),
     legend.text = element_text(size = 12),
     legend.key.size = unit(1, "cm")
@@ -304,18 +314,21 @@ drainage_plot <- ggplot(drainage_marginal_combined_df, aes(x = drainagecl, y = e
 
   # positions stay on the model's log scale, but labels are converted back to feet
   scale_y_continuous(labels = function(x) round(exp(x), 0)) +
+  # numeric 1-7 codes (matching the drainagecl factor's level order set above)
+  # so the ordering reads directly off the x-axis, alongside the color legend
+  scale_x_discrete(labels = as.character(1:7)) +
   # same drainage-level color scheme (sequential green) as dataset_visualization.R's
-  # p_drainage; drainage class is already shown on the x-axis, so its color legend is
-  # redundant and hidden
+  # p_drainage; legend labels carry the same 1-7 numbering as the x-axis so the
+  # correspondence lives in the legend, not spelled out again in the axis title
   scale_color_brewer(palette = "Greens", name = "Soil Drainage Level",
                      labels = c(
-                       "Very poorly drained" = "Very poor",
-                       "Poorly drained" = "Poorly",
-                       "Somewhat poorly drained" = "Somewhat poor",
-                       "Moderately well drained" = "Moderately well",
-                       "Well drained" = "Well",
-                       "Somewhat excessively drained" = "Somewhat excessive",
-                       "Excessively drained" = "Excessive"
+                       "Very poorly drained" = "1 Very poor",
+                       "Poorly drained" = "2 Poorly",
+                       "Somewhat poorly drained" = "3 Somewhat poor",
+                       "Moderately well drained" = "4 Moderately well",
+                       "Well drained" = "5 Well",
+                       "Somewhat excessively drained" = "6 Somewhat excessive",
+                       "Excessively drained" = "7 Excessive"
                      )) +
   scale_shape_manual(values = c("Direct" = 16, "Non-spatial Indirect" = 17)) +
   scale_linetype_manual(values = c("Direct" = "solid", "Non-spatial Indirect" = "dashed")) +
@@ -329,18 +342,15 @@ drainage_plot <- ggplot(drainage_marginal_combined_df, aes(x = drainagecl, y = e
   ) +
   labs(
     y = "Well Depth (Feet)",
-    x  = "Drainage Level",
+    x  = "Soil Drainage Level",
     shape = "Method",
     linetype = "Method"
   ) +
   theme_bw() +
-  # Rotate x-axis labels for readability
   theme(
     axis.title.x = element_text(size = 15),
     axis.title.y = element_text(size = 15),
     axis.text = element_text(size = 13),
-    # axis.text.x = element_text(size = 18, angle = 45, hjust = 1),
-    axis.text.x = element_blank(),
     legend.title = element_text(size = 13),
     legend.text = element_text(size = 12),
     legend.key.size = unit(1, "cm")
