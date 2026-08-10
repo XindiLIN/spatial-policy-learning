@@ -53,6 +53,11 @@ area_key_map <- c(
 )
 
 threshold_val <- log(5)
+# Must match cv_hyperparameter.R's threshold_label so this driver looks up the
+# right cv_results_<area_key>_<threshold_label>.rds, and so this run's own
+# outputs (region_result_*, plss_sf_combine_*, region_pipeline_summary,
+# sanity maps) don't collide with a different threshold's run.
+threshold_label <- paste0("log", round(exp(threshold_val), 0))
 year_filter   <- 2020
 
 # Explicit county lists for PLSS sub-setting; NULL means use the counties
@@ -231,7 +236,7 @@ region_results <- list()
 
 for (area in areas) {
   area_key <- area_key_map[[area]]
-  result_path <- file.path(region_results_dir, sprintf("region_result_%s.rds", area_key))
+  result_path <- file.path(region_results_dir, sprintf("region_result_%s_%s.rds", area_key, threshold_label))
 
   if (use_cache && file.exists(result_path)) {
     cat(sprintf("Loading cached region result for %s...\n", area))
@@ -258,9 +263,9 @@ for (area in areas) {
 plss_sf_combine_direct <- do.call(rbind, lapply(region_results, `[[`, "plss_sf_direct"))
 plss_sf_combine_indirect_nonspatial <- do.call(rbind, lapply(region_results, `[[`, "plss_sf_indirect"))
 
-saveRDS(plss_sf_combine_direct, file.path(region_results_dir, "plss_sf_combine_direct.rds"))
+saveRDS(plss_sf_combine_direct, file.path(region_results_dir, sprintf("plss_sf_combine_direct_%s.rds", threshold_label)))
 saveRDS(plss_sf_combine_indirect_nonspatial,
-        file.path(region_results_dir, "plss_sf_combine_indirect_nonspatial.rds"))
+        file.path(region_results_dir, sprintf("plss_sf_combine_indirect_nonspatial_%s.rds", threshold_label)))
 
 # Summary table: chosen hyperparameters + train/test metrics per region,
 # for a quick sanity check before handing off to policy_visualization.r
@@ -274,7 +279,7 @@ summary_df <- do.call(rbind, lapply(region_results, function(r) {
   )
 }))
 rownames(summary_df) <- NULL
-saveRDS(summary_df, file.path(region_results_dir, "region_pipeline_summary.rds"))
+saveRDS(summary_df, file.path(region_results_dir, sprintf("region_pipeline_summary_%s.rds", threshold_label)))
 print(summary_df)
 
 
@@ -303,9 +308,9 @@ make_sanity_map <- function(plss_sf, title_str) {
     theme_void()
 }
 
-ggsave(file.path("nitrate_data_analysis/figures", "sanity_map_direct.png"),
+ggsave(file.path("nitrate_data_analysis/figures", sprintf("sanity_map_direct_%s.png", threshold_label)),
        make_sanity_map(plss_sf_combine_direct, "Direct Method"),
        width = 8, height = 7, dpi = 200, bg = "white")
-ggsave(file.path("nitrate_data_analysis/figures", "sanity_map_indirect_nonspatial.png"),
+ggsave(file.path("nitrate_data_analysis/figures", sprintf("sanity_map_indirect_nonspatial_%s.png", threshold_label)),
        make_sanity_map(plss_sf_combine_indirect_nonspatial, "Non-Spatial Indirect Method"),
        width = 8, height = 7, dpi = 200, bg = "white")
