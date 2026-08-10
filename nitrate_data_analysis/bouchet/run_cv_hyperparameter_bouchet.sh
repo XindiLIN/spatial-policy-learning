@@ -1,19 +1,19 @@
 #!/bin/bash
-# -c 16/--mem 128G validated against a real run: cv_hyperparameter.R with
-# cv_areas <- c("North East") only (120 (area, m, combo) tasks) completed in
-# 7m21s (sacct), most of that setup rather than the CV grid itself -- see the
-# git history for the diagnosis (mclapply parallelized only at the (area, m)
-# level, which underused this allocation, plus a since-confirmed-unnecessary
-# BLAS-backend theory) and the fixes (combo-level task granularity,
-# OMP_NUM_THREADS=1 below, and parallelizing per-area setup across areas).
-# cv_areas now covers all 9 regions (up to 1080 (area, m, combo) tasks) --
-# if --mem ever proves insufficient for the larger regions' Gram matrices
-# (e.g. Central's n_train ~4244 vs North East's ~1161), check sacct/seff
-# after a run and scale --mem up from there, same as phase ABC's tuning.
+# -c 16/--mem 128G validated against a real 9-region, 1-threshold run
+# (job 20941012): 8h07m wall-clock, 42.77% CPU efficiency, 45.08GB memory
+# (35.21% of 128G) -- see sacct/seff output and git history for the full
+# diagnosis. cv_thresholds now covers 3 thresholds (log(2), log(5), log(10))
+# instead of 1, tripling the (area, threshold, m, combo) task count to
+# ~3240 -- CPU-time should scale roughly 3x too (~167 core-hours), so even
+# at the same efficiency, wall-clock could plausibly exceed 12h; bumped -t
+# accordingly. --mem should NOT need to grow: k_raw (the dominant per-task
+# memory cost) depends only on (area, m), not threshold, so it isn't
+# duplicated per threshold. Checkpointing means a walltime kill isn't
+# catastrophic either way -- just resubmit to pick up where it left off.
 #SBATCH -J cv_hyperparameter
 #SBATCH -c 16
 #SBATCH --mem=128G
-#SBATCH -t 12:00:00
+#SBATCH -t 24:00:00
 #SBATCH -o slurm-cv-%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=xindi.lin@yale.edu

@@ -176,6 +176,18 @@ cv_partial_path <- function(area_key, threshold_label, m, combo_idx) {
 cv_task_grid <- expand.grid(cv_area = cv_areas, cv_threshold = cv_thresholds, m = m_grid,
                              combo_idx = seq_len(n_combos), stringsAsFactors = FALSE)
 
+# Sort largest-region tasks first (regions vary a lot in n_train -- e.g.
+# Central ~4244 vs North East ~1161 -- and RKHS operations scale worse than
+# linearly with n, so a combo for a big region costs much more than one for
+# a small region). Dispatching big-region tasks first means that once
+# small-region tasks are exhausted late in the run, only OTHER big-region
+# tasks remain to fill the cores, rather than a handful of slow stragglers
+# with most of the allocation idle -- a real, measured effect (42.77% CPU
+# efficiency on the last full run) attributed to exactly this kind of
+# end-of-run task-size imbalance.
+n_train_by_area <- vapply(area_ctxs, function(ctx) nrow(ctx$data_split$data), numeric(1))
+cv_task_grid <- cv_task_grid[order(-n_train_by_area[cv_task_grid$cv_area]), , drop = FALSE]
+
 run_one_cv_task <- function(cv_area, cv_threshold, m, combo_idx) {
   ctx             <- area_ctxs[[cv_area]]
   threshold_label <- threshold_label_for(cv_threshold)
