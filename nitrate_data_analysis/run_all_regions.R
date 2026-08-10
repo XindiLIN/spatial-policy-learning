@@ -95,17 +95,23 @@ dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 region_results_dir <- file.path(output_dir, "area_results")
 dir.create(region_results_dir, recursive = TRUE, showWarnings = FALSE)
 
-# Parallelizes the per-observation DC warm start (piece iii). On a SLURM
-# cluster (e.g. Yale's Bouchet), detectCores() reports the whole node's core
-# count, not what the job was actually allocated -- read SLURM's own env var
-# when present, and only fall back to detectCores() - 1 for local/laptop runs
-# outside SLURM (matches cv_hyperparameter.R's mc.cores pattern). Safe to use
-# the full allocation here since regions are processed sequentially, not
-# concurrently -- see the main loop below.
-# (Hyperparameter CV (piece v) is no longer run from here -- see
-# run_region_pipeline() below -- so there's no cv_mc.cores anymore.)
-init_mc.cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = NA))
-if (is.na(init_mc.cores)) init_mc.cores <- max(1, parallel::detectCores() - 1)
+# On a SLURM cluster (e.g. Yale's Bouchet), detectCores() reports the whole
+# node's core count, not what the job was actually allocated -- read SLURM's
+# own env var when present, and only fall back to detectCores() - 1 for
+# local/laptop runs outside SLURM (matches cv_hyperparameter.R's mc.cores
+# pattern). This is the TOTAL budget, split across two levels below: across
+# (area, threshold) tasks (the main loop), and within each task's own piece
+# (iii) per-observation DC warm start. Piece (iv), the DC algorithm itself,
+# is single-threaded -- running regions sequentially left most of a 16-core
+# allocation idle for that entire serial phase, every region, every
+# threshold (measured: 6.4% CPU efficiency over a 4-hour run). Running many
+# (area, threshold) tasks concurrently instead fills that idle time with
+# OTHER tasks' work, since all 9 areas x however many thresholds are fully
+# independent (separate data, separate area_key/threshold-scoped caches).
+mc.cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = NA))
+if (is.na(mc.cores)) mc.cores <- max(1, parallel::detectCores() - 1)
+
+max_region_attempts <- 5  # retry passes over still-missing (area, threshold) tasks
 
 use_cache <- TRUE  # reuse cached outcome_reg / smoothers / CV / region results
 
@@ -227,18 +233,87 @@ run_region_pipeline <- function(area,
 
 
 # ============================================================
-# MAIN LOOP -- apply the pipeline to every (threshold, region)
+# CHECKPOINTED, RETRYABLE MAIN LOOP -- one task per (area, threshold)
 # ============================================================
-# Sequential across regions (each region already parallelizes internally
-# via init_mc.cores for piece (iii)'s DC warm start); nesting mclapply at
-# both levels would oversubscribe cores. Each region's full result is
-# cached per threshold, so re-running this script after an interruption --
-# or after adding a new threshold to threshold_vals -- picks up where it
-# left off: already-completed (threshold, area) pairs are recognized via
-# their threshold-namespaced result_path and skipped, not recomputed.
+# Parallelized across (area, threshold) pairs -- fully independent, so
+# running many concurrently fills the idle time piece (iv)'s single-threaded
+# DC algorithm otherwise leaves on the table (see mc.cores comment above).
+# Each concurrently-running task gets a share of mc.cores for its OWN piece
+# (iii) internal parallelism, sized so the two levels together don't
+# oversubscribe the allocation.
 #
-# wi_counties.rds is threshold-independent (just Wisconsin county
-# boundaries), so it's loaded/cached once outside the threshold loop.
+# Checkpointed and retryable the same way as cv_hyperparameter.R: each task
+# writes its own region_result_<area_key>_<threshold_label>.rds the moment
+# it finishes, so a killed/OOM'd run resumes without redoing already-
+# completed (area, threshold) work, and adding a new threshold to
+# threshold_vals later only computes the new pairs, not the old ones.
+
+region_threshold_grid <- expand.grid(area = areas, threshold_val = threshold_vals, stringsAsFactors = FALSE)
+
+n_concurrent_tasks <- min(nrow(region_threshold_grid), mc.cores)
+# Cores left over for each concurrently-running task's own piece (iii)
+# parallelism, after the outer (area, threshold) level's share.
+init_mc.cores_per_task <- max(1, floor(mc.cores / n_concurrent_tasks))
+
+region_result_path <- function(area_key, threshold_label) {
+  file.path(region_results_dir, sprintf("region_result_%s_%s.rds", area_key, threshold_label))
+}
+
+run_one_region_threshold <- function(area, threshold_val) {
+  area_key        <- area_key_map[[area]]
+  threshold_label <- threshold_label_for(threshold_val)
+  label <- sprintf("area=%s | threshold=%s", area, threshold_label)
+
+  result <- run_region_pipeline(
+    area = area,
+    data_all = data_all, plss_covariates_all = plss_covariates_all, output_dir = output_dir,
+    threshold_val = threshold_val,
+    plss_county_override = plss_county_override, plss_crop_exclude = plss_crop_exclude,
+    init_mc.cores = init_mc.cores_per_task,
+    use_cache = use_cache
+  )
+  saveRDS(result, region_result_path(area_key, threshold_label))
+  cat(sprintf("%s: done\n", label))
+  flush(stdout())
+  result
+}
+
+cat(sprintf("\nrun_all_regions: %d area(s) x %d threshold(s) = %d (area, threshold) tasks, %d concurrent, %d core(s) each for piece iii\n\n",
+            length(areas), length(threshold_vals), nrow(region_threshold_grid), n_concurrent_tasks, init_mc.cores_per_task))
+flush(stdout())
+
+for (attempt in seq_len(max_region_attempts)) {
+  area_keys_for_task <- area_key_map[region_threshold_grid$area]
+  threshold_labels_for_task <- vapply(region_threshold_grid$threshold_val, threshold_label_for, character(1))
+  already_done <- use_cache & file.exists(region_result_path(area_keys_for_task, threshold_labels_for_task))
+  todo_grid <- region_threshold_grid[!already_done, , drop = FALSE]
+
+  if (nrow(todo_grid) == 0) {
+    if (attempt == 1) cat(sprintf("run_all_regions: all %d task(s) already done, nothing to run\n", nrow(region_threshold_grid)))
+    break
+  }
+
+  cat(sprintf("run_all_regions attempt %d/%d: %d of %d task(s) remaining\n",
+              attempt, max_region_attempts, nrow(todo_grid), nrow(region_threshold_grid)))
+  flush(stdout())
+
+  # mclapply silently returns NULL (not a "try-error") for a task whose
+  # forked worker gets OOM-killed by the OS -- the missing-task check
+  # below catches that case, not just R-level errors caught via try().
+  parallel::mclapply(seq_len(nrow(todo_grid)), function(k) {
+    run_one_region_threshold(todo_grid$area[k], todo_grid$threshold_val[k])
+  }, mc.cores = n_concurrent_tasks)
+}
+
+
+# ============================================================
+# RESULTS + VISUALISATION -- per threshold, reassembled from disk
+# ============================================================
+# Reads from disk (not from mclapply's return values), so tasks completed in
+# an earlier attempt or a previous run of this script aren't lost even if a
+# later retry's mclapply call itself fails partway through on the
+# remaining tasks. wi_counties.rds is threshold-independent (just Wisconsin
+# county boundaries), so it's loaded/cached once outside the threshold loop.
 
 wi_counties_path <- file.path(output_dir, "wi_counties.rds")
 if (file.exists(wi_counties_path)) {
@@ -265,28 +340,22 @@ for (threshold_val in threshold_vals) {
   cat(sprintf("\n%s\n%s THRESHOLD = %s %s\n%s\n", strrep("#", 60), strrep("#", 10), threshold_label, strrep("#", 10), strrep("#", 60)))
   flush(stdout())
 
-  region_results <- list()
+  region_results <- lapply(areas, function(area) {
+    path <- region_result_path(area_key_map[[area]], threshold_label)
+    if (file.exists(path)) readRDS(path) else NULL
+  })
+  names(region_results) <- areas
 
-  for (area in areas) {
-    area_key <- area_key_map[[area]]
-    result_path <- file.path(region_results_dir, sprintf("region_result_%s_%s.rds", area_key, threshold_label))
-
-    if (use_cache && file.exists(result_path)) {
-      cat(sprintf("Loading cached region result for %s / %s...\n", area, threshold_label))
-      flush(stdout())
-      region_results[[area]] <- readRDS(result_path)
-      next
-    }
-
-    region_results[[area]] <- run_region_pipeline(
-      area = area,
-      data_all = data_all, plss_covariates_all = plss_covariates_all, output_dir = output_dir,
-      threshold_val = threshold_val,
-      plss_county_override = plss_county_override, plss_crop_exclude = plss_crop_exclude,
-      init_mc.cores = init_mc.cores,
-      use_cache = use_cache
-    )
-    saveRDS(region_results[[area]], result_path)
+  missing <- vapply(region_results, is.null, logical(1))
+  if (any(missing)) {
+    cat(sprintf("\nWARNING: %d of %d region(s) still missing for threshold %s after %d attempt(s): %s\n",
+                sum(missing), length(areas), threshold_label, max_region_attempts, paste(areas[missing], collapse = ", ")))
+    cat("Re-run this script to retry just the missing (area, threshold) tasks.\n\n")
+  }
+  region_results <- region_results[!missing]
+  if (length(region_results) == 0) {
+    cat(sprintf("No completed regions for threshold %s -- skipping combine/summary/sanity map.\n", threshold_label))
+    next
   }
 
 
