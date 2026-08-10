@@ -104,7 +104,8 @@ area_ctxs <- parallel::mclapply(cv_areas, function(cv_area) {
 
   region_base <- fit_region_base(data_split = data_split, area_key = area_key, output_dir = output_dir)
   kdm_info    <- build_kernel_design_matrix(data_split = data_split, region_base = region_base)
-  fold_id     <- assign_folds(nrow(data_split$data), n_folds = cv_folds, seed_value = cv_seed)
+  fold_id     <- assign_folds(nrow(data_split$data), n_folds = cv_folds, seed_value = cv_seed,
+                               strata = data_split$data$logconcentration_plus_median > cv_threshold)
   outcome_resid <- data_split$data$logconcentration_plus_median -
     region_base$outcome_reg$pred - region_base$outcome_reg$krige_values
 

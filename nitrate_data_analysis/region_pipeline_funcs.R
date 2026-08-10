@@ -489,9 +489,26 @@ fit_direct_dc_policy <- function(data_split, region_base, prep,
 # made in the existing nitrate_data_analysis/cv_hyperparameter.R,
 # which is necessary here since CV runs this many times per region.
 
-assign_folds <- function(n, n_folds = 5, seed_value = 42) {
+assign_folds <- function(n, n_folds = 5, seed_value = 42, strata = NULL) {
   set.seed(seed_value)
-  sample(rep(1:n_folds, length.out = n))
+  if (is.null(strata)) {
+    return(sample(rep(1:n_folds, length.out = n)))
+  }
+  # Stratified: assign fold labels independently within each stratum level
+  # (e.g. Y > threshold_val) so every fold gets a proportional share of the
+  # positive class, rather than leaving that to chance -- matters when the
+  # positive rate is low (e.g. the 10mg/L threshold, where some regions are
+  # under 5% positive), since plain random assignment can otherwise land a
+  # fold with too few positive cases to compute a defined MCC.
+  if (length(strata) != n) {
+    stop(sprintf("assign_folds(): length(strata) = %d must equal n = %d", length(strata), n))
+  }
+  fold_id <- integer(n)
+  for (s in unique(strata)) {
+    idx <- which(strata == s)
+    fold_id[idx] <- sample(rep(1:n_folds, length.out = length(idx)))
+  }
+  fold_id
 }
 
 fit_one_fold_direct <- function(k_train, k_holdout, data_fold_train, T_holdout, Y_holdout,
@@ -635,7 +652,8 @@ choose_direct_hyperparameters_cv <- function(data_split, region_base, kdm_info,
                                               seed_value = 42, mc.cores = 1, maxit = 350) {
 
   data_train <- data_split$data
-  fold_id    <- assign_folds(nrow(data_train), n_folds = n_folds, seed_value = seed_value)
+  fold_id    <- assign_folds(nrow(data_train), n_folds = n_folds, seed_value = seed_value,
+                              strata = data_train$logconcentration_plus_median > threshold_val)
   outcome_resid <- data_train$logconcentration_plus_median -
     region_base$outcome_reg$pred - region_base$outcome_reg$krige_values
 
