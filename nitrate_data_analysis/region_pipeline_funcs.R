@@ -70,7 +70,17 @@ fit_region_base <- function(data_split, area_key, output_dir,
 
   dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
-  outcome_reg_path <- file.path(output_dir, sprintf("outcome_regression_%s.rds", area_key))
+  # Threshold-independent caches (outcome regression, smoothers don't depend on
+  # the classification threshold, only region+year data) live in their own
+  # subfolders under output_dir, separate from threshold-namespaced caches
+  # (CV results, DC warm starts) -- see nitrate_data_analysis/output/'s own
+  # layout for the full convention.
+  outcome_reg_dir <- file.path(output_dir, "outcome_regressions")
+  smoothers_dir   <- file.path(output_dir, "smoothers")
+  dir.create(outcome_reg_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(smoothers_dir, recursive = TRUE, showWarnings = FALSE)
+
+  outcome_reg_path <- file.path(outcome_reg_dir, sprintf("outcome_regression_%s.rds", area_key))
   if (use_cache && file.exists(outcome_reg_path)) {
     cat("Loading cached outcome regression...\n")
     outcome_reg <- readRDS(outcome_reg_path)
@@ -107,7 +117,7 @@ fit_region_base <- function(data_split, area_key, output_dir,
   kernel_bw_silverman <- 1.06 * sd(data_split$data$logWellDepth) *
     nrow(data_split$data)^(-1 / 5)
 
-  smoothers_path <- file.path(output_dir, sprintf("smoothers_%s.rds", area_key))
+  smoothers_path <- file.path(smoothers_dir, sprintf("smoothers_%s.rds", area_key))
   if (use_cache && file.exists(smoothers_path)) {
     cat("Loading cached smoothers...\n")
     smoothers <- readRDS(smoothers_path)
@@ -335,7 +345,9 @@ prep_direct_method_inputs <- function(data_split, region_base, kdm_info, m, kern
   # point -- and since this function only runs once per FINAL chosen
   # hyperparameter set (not once per CV grid combo), that's still cheap.
   threshold_label   <- paste0("log", round(exp(threshold_val), 0))
-  direct_init_path  <- file.path(output_dir,
+  initial_values_dir <- file.path(output_dir, "initial_values")
+  dir.create(initial_values_dir, recursive = TRUE, showWarnings = FALSE)
+  direct_init_path  <- file.path(initial_values_dir,
     sprintf("direct_init_%s_%s_bw%.4f.rds", area_key, threshold_label, kernel_bw))
   if (use_cache && file.exists(direct_init_path)) {
     cat("Loading cached direct_init warm start...\n")

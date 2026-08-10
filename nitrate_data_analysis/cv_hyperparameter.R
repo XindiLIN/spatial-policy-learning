@@ -154,7 +154,8 @@ kraw_by_area_m <- lapply(area_ctxs, function(ctx) {
   setNames(lapply(m_grid, function(m) build_kraw_for_m(m, ctx$kdm_info$kdm)), as.character(m_grid))
 })
 
-cv_partial_dir <- file.path(output_dir, "cv_partial")
+hyper_parameter_cv_dir <- file.path(output_dir, "hyper_parameter_cv")
+cv_partial_dir <- file.path(hyper_parameter_cv_dir, "cv_partial")
 dir.create(cv_partial_dir, recursive = TRUE, showWarnings = FALSE)
 
 cv_partial_path <- function(area_key, m, combo_idx) {
@@ -265,7 +266,7 @@ for (cv_area in cv_areas) {
                 cv_area, nrow(cv_results), length(m_grid)))
   }
 
-  cv_rds_path <- file.path(output_dir, sprintf("cv_results_%s_%s.rds", area_key, threshold_label))
+  cv_rds_path <- file.path(hyper_parameter_cv_dir, sprintf("cv_results_%s_%s.rds", area_key, threshold_label))
   saveRDS(cv_results, cv_rds_path)
   cat(sprintf("\nFull CV grid for %s saved to: %s\n", cv_area, cv_rds_path))
 

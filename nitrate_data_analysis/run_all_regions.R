@@ -167,7 +167,7 @@ run_region_pipeline <- function(area,
   # first. Failing loudly here instead keeps there being exactly one way to
   # compute CV results.
   threshold_label <- paste0("log", round(exp(threshold_val), 0))
-  cv_path <- file.path(output_dir, sprintf("cv_results_%s_%s.rds", area_key, threshold_label))
+  cv_path <- file.path(output_dir, "hyper_parameter_cv", sprintf("cv_results_%s_%s.rds", area_key, threshold_label))
   if (!file.exists(cv_path)) {
     stop(sprintf(
       "run_region_pipeline(): no CV results found for %s at %s. Run cv_hyperparameter.R for this area first (add \"%s\" to its cv_areas).",
