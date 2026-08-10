@@ -135,6 +135,7 @@ run_region_pipeline <- function(area,
 
   area_key <- area_key_map[[area]]
   cat(sprintf("\n%s\nRegion: %s (%s)\n%s\n", strrep("=", 60), area, area_key, strrep("=", 60)))
+  flush(stdout())
 
   data_area  <- data_all[data_all$area == area, ]
   data_split <- split_nitrate_data(data_area)
@@ -175,6 +176,7 @@ run_region_pipeline <- function(area,
     ))
   }
   cat("Loading CV results...\n")
+  flush(stdout())
   cv_results <- readRDS(cv_path)
   if (all(is.na(cv_results$mcc) | is.nan(cv_results$mcc))) {
     stop(sprintf("run_region_pipeline(): every combo's mcc in %s is NA/undefined.", cv_path))
@@ -182,6 +184,7 @@ run_region_pipeline <- function(area,
   best <- cv_results[which.max(cv_results$mcc), ]
   cat(sprintf("Best CV hyperparameters: m=%.1f  lambda=%.2f  kernel_bw_mult=%.1f  (CV mcc=%.4f)\n",
               best$m, best$lambda, best$kernel_bw_mult, best$mcc))
+  flush(stdout())
 
   # (iii) preparations before the DC algorithm, at the CV-chosen m/kernel_bw
   prep <- prep_direct_method_inputs(
@@ -260,6 +263,7 @@ make_sanity_map <- function(plss_sf, title_str) {
 for (threshold_val in threshold_vals) {
   threshold_label <- threshold_label_for(threshold_val)
   cat(sprintf("\n%s\n%s THRESHOLD = %s %s\n%s\n", strrep("#", 60), strrep("#", 10), threshold_label, strrep("#", 10), strrep("#", 60)))
+  flush(stdout())
 
   region_results <- list()
 
@@ -269,6 +273,7 @@ for (threshold_val in threshold_vals) {
 
     if (use_cache && file.exists(result_path)) {
       cat(sprintf("Loading cached region result for %s / %s...\n", area, threshold_label))
+      flush(stdout())
       region_results[[area]] <- readRDS(result_path)
       next
     }

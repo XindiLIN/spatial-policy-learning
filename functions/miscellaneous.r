@@ -491,6 +491,7 @@ run_dc_algorithm <- function(params_initial,
   for(k in 1:max_iter){
 
     cat(k,'-th iteration of DC algorithm','\n')
+    flush(stdout())
 
     sub_result <- optim(par = params_old,
                         fn = compute_total_loss_smooth_dc_approx_RKHS,
