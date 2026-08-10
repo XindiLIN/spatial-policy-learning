@@ -8,18 +8,22 @@
 # run_all_regions.R's automatic per-region CV.
 #
 # Checkpointed and retryable, same pattern as
-# simulation/simulation_nonparametric_run_phaseABC.R: each (area, m) task
-# writes its own result to nitrate_data_analysis/output/cv_partial/ the
-# moment it finishes, so a killed/OOM'd run can be re-run and pick up where
-# it left off instead of redoing already-completed (area, m) work. Tasks
-# still missing after all retry attempts are reported explicitly -- not
-# silently dropped -- so an incomplete run is never mistaken for a
-# complete one.
+# simulation/simulation_nonparametric_run_phaseABC.R: each (area, threshold,
+# m, combo) task writes its own result to
+# nitrate_data_analysis/output/hyper_parameter_cv/cv_partial/ the moment it
+# finishes, so a killed/OOM'd run can be re-run and pick up where it left
+# off instead of redoing already-completed work -- this includes adding a
+# NEW threshold to cv_thresholds later: already-completed thresholds are
+# recognized as done (via their threshold-namespaced checkpoint filenames)
+# and skipped entirely, not recomputed. Tasks still missing after all retry
+# attempts are reported explicitly -- not silently dropped -- so an
+# incomplete run is never mistaken for a complete one.
 #
-# cv_areas is a vector so this scales from "just North East, to see what
-# happens" (its current default) up to all 9 regions later without any
-# other changes -- the (area, m) task grid, checkpointing, and per-area
-# results/plots below already handle either case.
+# cv_areas and cv_thresholds are both vectors, so this scales from "just
+# North East at log(5), to see what happens" up to all 9 regions x however
+# many thresholds without any other changes -- the (area, threshold, m,
+# combo) task grid, checkpointing, and per-(area, threshold) results/plots
+# below already handle any combination.
 #
 # Speed tips (see bottom of file for full discussion):
 #   - Reduce cv_folds to 3
@@ -38,7 +42,7 @@ library(ggplot2)
 
 cv_areas       <- c("Central", "Northwest", "North East", "North Central", "West Central",
                      "East Central", "South West", "South Central", "South East")
-cv_threshold   <- log(5)           # e.g. log(2), log(5), log(10)
+cv_thresholds  <- c(log(2), log(5), log(10))  # any number of thresholds; all get run
 cv_seed        <- 42               # fixed seed for fold assignment
 cv_folds       <- 5                # number of CV folds
 optim_maxit_cv <- 300              # maxit for optim inside each CV fold
@@ -46,12 +50,12 @@ optim_maxit_cv <- 300              # maxit for optim inside each CV fold
 output_dir     <- "nitrate_data_analysis/output"
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 year_filter    <- 2020             # set NULL to use all years
-max_cv_attempts <- 5               # retry passes over still-missing (area, m) tasks
+max_cv_attempts <- 5               # retry passes over still-missing (area, threshold, m, combo) tasks
 
 # On a SLURM cluster (e.g. Yale's Bouchet), detectCores() reports the whole
 # node's core count, not what the job was actually allocated -- read SLURM's
 # own env var when present, and only fall back to detectCores() - 1 for
-# local/laptop runs outside SLURM. Parallelizes across (area, m) tasks.
+# local/laptop runs outside SLURM. Parallelizes across (area, threshold, m, combo) tasks.
 mc.cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = NA))
 if (is.na(mc.cores)) mc.cores <- max(1, parallel::detectCores() - 1)
 
@@ -75,7 +79,9 @@ area_key_map <- c(
   "South East"    = "south_east"
 )
 
-threshold_label <- paste0("log", round(exp(cv_threshold), 0))
+# Naming convention shared with run_all_regions.R/region_pipeline_funcs.R's
+# own threshold_label computations -- keep these in sync.
+threshold_label_for <- function(threshold_val) paste0("log", round(exp(threshold_val), 0))
 
 
 # ============================================================
@@ -104,8 +110,11 @@ area_ctxs <- parallel::mclapply(cv_areas, function(cv_area) {
 
   region_base <- fit_region_base(data_split = data_split, area_key = area_key, output_dir = output_dir)
   kdm_info    <- build_kernel_design_matrix(data_split = data_split, region_base = region_base)
-  fold_id     <- assign_folds(nrow(data_split$data), n_folds = cv_folds, seed_value = cv_seed,
-                               strata = data_split$data$logconcentration_plus_median > cv_threshold)
+  # fold_id is NOT computed here -- it's threshold-dependent (stratified by
+  # Y > threshold_val), so it's computed per (area, threshold) task instead,
+  # inside run_one_cv_task(). Everything else in this context (region_base,
+  # kdm_info, outcome_resid) is threshold-independent and shared across all
+  # of cv_thresholds.
   outcome_resid <- data_split$data$logconcentration_plus_median -
     region_base$outcome_reg$pred - region_base$outcome_reg$krige_values
 
@@ -114,7 +123,7 @@ area_ctxs <- parallel::mclapply(cv_areas, function(cv_area) {
 
   list(cv_area = cv_area, area_key = area_key, data_split = data_split,
        region_base = region_base, kdm_info = kdm_info,
-       fold_id = fold_id, outcome_resid = outcome_resid)
+       outcome_resid = outcome_resid)
 }, mc.cores = min(length(cv_areas), mc.cores))
 names(area_ctxs) <- cv_areas
 
@@ -139,11 +148,11 @@ if (any(setup_failed)) {
 
 combo_grid <- expand.grid(lambda = lambda_grid, kernel_bw_mult = bw_mult_grid, stringsAsFactors = FALSE)
 n_combos   <- nrow(combo_grid)
+n_tasks_total <- length(cv_areas) * length(cv_thresholds) * length(m_grid) * n_combos
 cat(sprintf(
-  "\nCV for %d area(s) x %d m-values x %d combos, threshold=log(%g)\n%d total (area, m, combo) tasks x %d folds = %d optim runs\n\n",
-  length(cv_areas), length(m_grid), n_combos, round(exp(cv_threshold)),
-  length(cv_areas) * length(m_grid) * n_combos, cv_folds,
-  length(cv_areas) * length(m_grid) * n_combos * cv_folds
+  "\nCV for %d area(s) x %d threshold(s) (%s) x %d m-values x %d combos\n%d total (area, threshold, m, combo) tasks x %d folds = %d optim runs\n\n",
+  length(cv_areas), length(cv_thresholds), paste(vapply(cv_thresholds, threshold_label_for, character(1)), collapse = ", "),
+  length(m_grid), n_combos, n_tasks_total, cv_folds, n_tasks_total * cv_folds
 ))
 
 # k_raw depends only on (area, m), not on the combo -- build it once per
@@ -159,25 +168,33 @@ hyper_parameter_cv_dir <- file.path(output_dir, "hyper_parameter_cv")
 cv_partial_dir <- file.path(hyper_parameter_cv_dir, "cv_partial")
 dir.create(cv_partial_dir, recursive = TRUE, showWarnings = FALSE)
 
-cv_partial_path <- function(area_key, m, combo_idx) {
+cv_partial_path <- function(area_key, threshold_label, m, combo_idx) {
   file.path(cv_partial_dir, sprintf("%s_%s_m%s_c%03d.rds",
             area_key, threshold_label, gsub("-", "neg", sprintf("%.2f", m)), combo_idx))
 }
 
-cv_task_grid <- expand.grid(cv_area = cv_areas, m = m_grid, combo_idx = seq_len(n_combos), stringsAsFactors = FALSE)
+cv_task_grid <- expand.grid(cv_area = cv_areas, cv_threshold = cv_thresholds, m = m_grid,
+                             combo_idx = seq_len(n_combos), stringsAsFactors = FALSE)
 
-run_one_cv_task <- function(cv_area, m, combo_idx) {
-  ctx            <- area_ctxs[[cv_area]]
-  lambda         <- combo_grid$lambda[combo_idx]
-  kernel_bw_mult <- combo_grid$kernel_bw_mult[combo_idx]
-  label <- sprintf("area=%s | m=%.2f | combo %d/%d (lambda=%.2f, kernel_bw_mult=%.2f)",
-                    cv_area, m, combo_idx, n_combos, lambda, kernel_bw_mult)
+run_one_cv_task <- function(cv_area, cv_threshold, m, combo_idx) {
+  ctx             <- area_ctxs[[cv_area]]
+  threshold_label <- threshold_label_for(cv_threshold)
+  lambda          <- combo_grid$lambda[combo_idx]
+  kernel_bw_mult  <- combo_grid$kernel_bw_mult[combo_idx]
+  label <- sprintf("area=%s | threshold=%s | m=%.2f | combo %d/%d (lambda=%.2f, kernel_bw_mult=%.2f)",
+                    cv_area, threshold_label, m, combo_idx, n_combos, lambda, kernel_bw_mult)
+
+  # Stratified by Y > threshold_val (see assign_folds()) -- deterministic given
+  # cv_seed, so recomputing per task (rather than precomputing once per
+  # (area, threshold)) is cheap and avoids an extra nested cache structure.
+  fold_id <- assign_folds(nrow(ctx$data_split$data), n_folds = cv_folds, seed_value = cv_seed,
+                           strata = ctx$data_split$data$logconcentration_plus_median > cv_threshold)
 
   result <- cv_fit_one_combo(
     lambda = lambda, kernel_bw_mult = kernel_bw_mult,
     kernel_bw_baseline = ctx$region_base$kernel_bw_silverman,
     k_raw = kraw_by_area_m[[cv_area]][[as.character(m)]],
-    data_train = ctx$data_split$data, fold_id = ctx$fold_id, n_folds = cv_folds,
+    data_train = ctx$data_split$data, fold_id = fold_id, n_folds = cv_folds,
     threshold_val = cv_threshold, depth_range = ctx$region_base$depth_range,
     krige_values = ctx$region_base$outcome_reg$krige_values,
     weights = ctx$region_base$weights_cbps$weights,
@@ -186,28 +203,36 @@ run_one_cv_task <- function(cv_area, m, combo_idx) {
     cumint_smoothers_RKHS = ctx$region_base$smoothers$cumint_smoothers_RKHS,
     maxit = optim_maxit_cv
   )
-  result$m        <- m
-  result$cv_area  <- cv_area
-  result$area_key <- ctx$area_key
+  result$m               <- m
+  result$cv_area          <- cv_area
+  result$area_key         <- ctx$area_key
+  result$threshold_val    <- cv_threshold
+  result$threshold_label  <- threshold_label
 
-  # Incremental checkpoint: each (area, m, combo) task writes its own result
-  # to disk the moment it finishes, rather than only after the whole mclapply
-  # call returns -- if a later task crashes/OOMs, this one's result is
-  # already safely on disk.
-  saveRDS(result, file = cv_partial_path(ctx$area_key, m, combo_idx))
+  # Incremental checkpoint: each (area, threshold, m, combo) task writes its
+  # own result to disk the moment it finishes, rather than only after the
+  # whole mclapply call returns -- if a later task crashes/OOMs, this one's
+  # result is already safely on disk. Threshold-namespaced filenames mean an
+  # already-completed threshold (e.g. log5) is recognized as done and
+  # skipped entirely when a new threshold is added to cv_thresholds.
+  saveRDS(result, file = cv_partial_path(ctx$area_key, threshold_label, m, combo_idx))
   na_note <- if (result$n_na_folds > 0) sprintf("  [%d/%d folds had undefined mcc]", result$n_na_folds, cv_folds) else ""
   cat(sprintf("%s: done -> acc=%.4f mcc=%.4f f1=%.4f%s\n", label, result$acc, result$mcc, result$two_sided_f1, na_note))
   flush(stdout())
   result
 }
 
-# Skip any (area, m, combo) task that already has a checkpoint file from a
-# previous run (e.g. one that got OOM-killed partway through), and retry
-# whatever's still missing in a loop -- each retry only tackles the
-# shrinking set of missing tasks, re-checking cv_partial/ after every pass.
+# Skip any (area, threshold, m, combo) task that already has a checkpoint
+# file from a previous run -- e.g. one that got OOM-killed partway through,
+# OR (the common case when cv_thresholds grows) an entire threshold like
+# log5 that was already fully computed in an earlier run of this script --
+# and retry whatever's still missing in a loop -- each retry only tackles
+# the shrinking set of missing tasks, re-checking cv_partial/ after every pass.
+cv_task_threshold_labels <- vapply(cv_task_grid$cv_threshold, threshold_label_for, character(1))
+
 for (attempt in seq_len(max_cv_attempts)) {
   area_keys_for_task <- area_key_map[cv_task_grid$cv_area]
-  already_done <- file.exists(cv_partial_path(area_keys_for_task, cv_task_grid$m, cv_task_grid$combo_idx))
+  already_done <- file.exists(cv_partial_path(area_keys_for_task, cv_task_threshold_labels, cv_task_grid$m, cv_task_grid$combo_idx))
   todo_grid <- cv_task_grid[!already_done, , drop = FALSE]
 
   if (nrow(todo_grid) == 0) {
@@ -222,7 +247,7 @@ for (attempt in seq_len(max_cv_attempts)) {
   # forked worker gets OOM-killed by the OS -- the missing-task check
   # below catches that case, not just R-level errors caught via try().
   parallel::mclapply(seq_len(nrow(todo_grid)), function(k) {
-    run_one_cv_task(todo_grid$cv_area[k], todo_grid$m[k], todo_grid$combo_idx[k])
+    run_one_cv_task(todo_grid$cv_area[k], todo_grid$cv_threshold[k], todo_grid$m[k], todo_grid$combo_idx[k])
   }, mc.cores = min(nrow(todo_grid), mc.cores))
 }
 
@@ -230,16 +255,32 @@ for (attempt in seq_len(max_cv_attempts)) {
 # completed in an earlier attempt or a previous run of this script aren't
 # lost even if a later retry's mclapply call itself fails partway through
 # on the remaining tasks.
+#
+# cv_area/area_key/m/threshold_val/threshold_label are set here from the
+# authoritative cv_task_grid, NOT trusted from whatever's already inside the
+# loaded file -- a checkpoint written by an older version of this script
+# (from before threshold_label/threshold_val existed on the result object,
+# or any other future field changes) would otherwise silently produce NA
+# for those columns once bind_rows() combines it with newer-format results,
+# breaking the per-threshold filtering below.
 area_keys_for_task <- area_key_map[cv_task_grid$cv_area]
 cv_task_results <- lapply(seq_len(nrow(cv_task_grid)), function(k) {
-  path <- cv_partial_path(area_keys_for_task[k], cv_task_grid$m[k], cv_task_grid$combo_idx[k])
-  if (file.exists(path)) readRDS(path) else NULL
+  path <- cv_partial_path(area_keys_for_task[k], cv_task_threshold_labels[k], cv_task_grid$m[k], cv_task_grid$combo_idx[k])
+  if (!file.exists(path)) return(NULL)
+  result <- readRDS(path)
+  result$cv_area         <- cv_task_grid$cv_area[k]
+  result$area_key         <- area_keys_for_task[k]
+  result$m                <- cv_task_grid$m[k]
+  result$threshold_val    <- cv_task_grid$cv_threshold[k]
+  result$threshold_label  <- cv_task_threshold_labels[k]
+  result
 })
 
 missing <- vapply(cv_task_results, function(x) is.null(x) || inherits(x, "try-error"), logical(1))
 if (any(missing)) {
-  missing_desc <- sprintf("area=%s, m=%.2f, combo=%d",
-                           cv_task_grid$cv_area[missing], cv_task_grid$m[missing], cv_task_grid$combo_idx[missing])
+  missing_desc <- sprintf("area=%s, threshold=%s, m=%.2f, combo=%d",
+                           cv_task_grid$cv_area[missing], cv_task_threshold_labels[missing],
+                           cv_task_grid$m[missing], cv_task_grid$combo_idx[missing])
   cat(sprintf("\nWARNING: %d of %d CV task(s) are still missing after %d attempt(s):\n%s\n",
               sum(missing), nrow(cv_task_grid), max_cv_attempts, paste(missing_desc, collapse = "\n")))
   cat("Re-run this script to retry just the missing tasks (already-completed ones will be skipped).\n\n")
@@ -249,83 +290,88 @@ cv_results_all <- dplyr::bind_rows(cv_task_results[!missing])
 
 
 # ============================================================
-# RESULTS + VISUALISATION — per area
+# RESULTS + VISUALISATION — per threshold, per area
 # ============================================================
 
 dir.create("nitrate_data_analysis/figures", recursive = TRUE, showWarnings = FALSE)
 
-for (cv_area in cv_areas) {
-  area_key   <- area_key_map[[cv_area]]
-  cv_results <- cv_results_all[cv_results_all$cv_area == cv_area, ]
+for (cv_threshold in cv_thresholds) {
+  threshold_label <- threshold_label_for(cv_threshold)
 
-  if (nrow(cv_results) == 0) {
-    cat(sprintf("\nNo completed results for %s (all its tasks are still missing) -- skipping results/plots.\n", cv_area))
-    next
+  for (cv_area in cv_areas) {
+    area_key   <- area_key_map[[cv_area]]
+    cv_results <- cv_results_all[cv_results_all$cv_area == cv_area &
+                                    cv_results_all$threshold_label == threshold_label, ]
+
+    if (nrow(cv_results) == 0) {
+      cat(sprintf("\nNo completed results for %s / %s (all its tasks are still missing) -- skipping results/plots.\n", cv_area, threshold_label))
+      next
+    }
+    if (nrow(cv_results) < length(m_grid)) {
+      cat(sprintf("\nNote: %s / %s has results for only %d of %d m-values -- best-hyperparameter selection below is based on partial results.\n",
+                  cv_area, threshold_label, nrow(cv_results), length(m_grid)))
+    }
+
+    cv_rds_path <- file.path(hyper_parameter_cv_dir, sprintf("cv_results_%s_%s.rds", area_key, threshold_label))
+    saveRDS(cv_results, cv_rds_path)
+    cat(sprintf("\nFull CV grid for %s / %s saved to: %s\n", cv_area, threshold_label, cv_rds_path))
+
+    # ---- Best by CV MCC ----
+    best_idx    <- which.max(cv_results$mcc)
+    best_params <- cv_results[best_idx, ]
+
+    cat(sprintf("\n========== Best Hyperparameters for %s / %s (max CV MCC) ==========\n", cv_area, threshold_label))
+    cat(sprintf("  m               = %.1f\n",  best_params$m))
+    cat(sprintf("  lambda          = %.2f\n",  best_params$lambda))
+    cat(sprintf("  kernel_bw_mult  = %.1f  =>  kernel_bw = %.4f\n",
+                best_params$kernel_bw_mult, best_params$kernel_bw))
+    cat(sprintf("  CV MCC          = %.4f\n",  best_params$mcc))
+    cat(sprintf("  CV Accuracy     = %.4f\n",  best_params$acc))
+    cat(sprintf("  CV Two-sided F1 = %.4f\n",  best_params$two_sided_f1))
+    cat("=======================================================\n")
+
+    # 1. Heatmap of CV MCC for (m, lambda), averaged over kernel_bw_mult
+    cv_ml <- cv_results %>%
+      group_by(m, lambda) %>%
+      summarise(mean_mcc = mean(mcc, na.rm = TRUE), .groups = "drop")
+
+    p1 <- ggplot(cv_ml, aes(x = factor(lambda), y = factor(m), fill = mean_mcc)) +
+      geom_tile(color = "white") +
+      geom_text(aes(label = round(mean_mcc, 3)), size = 3) +
+      scale_fill_viridis_c(option = "plasma", name = "Mean CV MCC") +
+      labs(
+        title = sprintf("CV MCC — %s, threshold = %s", cv_area, threshold_label),
+        subtitle = "Averaged over kernel_bw_mult",
+        x = "lambda", y = "m"
+      ) +
+      theme_minimal()
+    print(p1)
+
+    p1_path <- file.path("nitrate_data_analysis/figures", sprintf("cv_heatmap_%s_%s.png", area_key, threshold_label))
+    ggsave(p1_path, p1, width = 7, height = 6, dpi = 150, bg = "white")
+    cat(sprintf("Heatmap saved to: %s\n", p1_path))
+
+    # 2. MCC vs kernel_bw_mult for the best (m, lambda)
+    cv_bw <- cv_results %>%
+      filter(m == best_params$m, lambda == best_params$lambda)
+
+    p2 <- ggplot(cv_bw, aes(x = kernel_bw_mult, y = mcc)) +
+      geom_line() +
+      geom_point(size = 2) +
+      geom_point(data = best_params, color = "red", size = 4) +
+      labs(
+        title   = sprintf("CV MCC vs kernel_bw multiplier — %s / %s (m=%.1f, lambda=%.2f)",
+                          cv_area, threshold_label, best_params$m, best_params$lambda),
+        x       = "kernel_bw_mult",
+        y       = "CV MCC"
+      ) +
+      theme_minimal()
+    print(p2)
+
+    p2_path <- file.path("nitrate_data_analysis/figures", sprintf("cv_bwmult_%s_%s.png", area_key, threshold_label))
+    ggsave(p2_path, p2, width = 7, height = 6, dpi = 150, bg = "white")
+    cat(sprintf("kernel_bw_mult plot saved to: %s\n", p2_path))
   }
-  if (nrow(cv_results) < length(m_grid)) {
-    cat(sprintf("\nNote: %s has results for only %d of %d m-values -- best-hyperparameter selection below is based on partial results.\n",
-                cv_area, nrow(cv_results), length(m_grid)))
-  }
-
-  cv_rds_path <- file.path(hyper_parameter_cv_dir, sprintf("cv_results_%s_%s.rds", area_key, threshold_label))
-  saveRDS(cv_results, cv_rds_path)
-  cat(sprintf("\nFull CV grid for %s saved to: %s\n", cv_area, cv_rds_path))
-
-  # ---- Best by CV MCC ----
-  best_idx    <- which.max(cv_results$mcc)
-  best_params <- cv_results[best_idx, ]
-
-  cat(sprintf("\n========== Best Hyperparameters for %s (max CV MCC) ==========\n", cv_area))
-  cat(sprintf("  m               = %.1f\n",  best_params$m))
-  cat(sprintf("  lambda          = %.2f\n",  best_params$lambda))
-  cat(sprintf("  kernel_bw_mult  = %.1f  =>  kernel_bw = %.4f\n",
-              best_params$kernel_bw_mult, best_params$kernel_bw))
-  cat(sprintf("  CV MCC          = %.4f\n",  best_params$mcc))
-  cat(sprintf("  CV Accuracy     = %.4f\n",  best_params$acc))
-  cat(sprintf("  CV Two-sided F1 = %.4f\n",  best_params$two_sided_f1))
-  cat("=======================================================\n")
-
-  # 1. Heatmap of CV MCC for (m, lambda), averaged over kernel_bw_mult
-  cv_ml <- cv_results %>%
-    group_by(m, lambda) %>%
-    summarise(mean_mcc = mean(mcc, na.rm = TRUE), .groups = "drop")
-
-  p1 <- ggplot(cv_ml, aes(x = factor(lambda), y = factor(m), fill = mean_mcc)) +
-    geom_tile(color = "white") +
-    geom_text(aes(label = round(mean_mcc, 3)), size = 3) +
-    scale_fill_viridis_c(option = "plasma", name = "Mean CV MCC") +
-    labs(
-      title = sprintf("CV MCC — %s, threshold = log(%g)", cv_area, round(exp(cv_threshold))),
-      subtitle = "Averaged over kernel_bw_mult",
-      x = "lambda", y = "m"
-    ) +
-    theme_minimal()
-  print(p1)
-
-  p1_path <- file.path("nitrate_data_analysis/figures", sprintf("cv_heatmap_%s_%s.png", area_key, threshold_label))
-  ggsave(p1_path, p1, width = 7, height = 6, dpi = 150, bg = "white")
-  cat(sprintf("Heatmap saved to: %s\n", p1_path))
-
-  # 2. MCC vs kernel_bw_mult for the best (m, lambda)
-  cv_bw <- cv_results %>%
-    filter(m == best_params$m, lambda == best_params$lambda)
-
-  p2 <- ggplot(cv_bw, aes(x = kernel_bw_mult, y = mcc)) +
-    geom_line() +
-    geom_point(size = 2) +
-    geom_point(data = best_params, color = "red", size = 4) +
-    labs(
-      title   = sprintf("CV MCC vs kernel_bw multiplier — %s (m=%.1f, lambda=%.2f)",
-                        cv_area, best_params$m, best_params$lambda),
-      x       = "kernel_bw_mult",
-      y       = "CV MCC"
-    ) +
-    theme_minimal()
-  print(p2)
-
-  p2_path <- file.path("nitrate_data_analysis/figures", sprintf("cv_bwmult_%s_%s.png", area_key, threshold_label))
-  ggsave(p2_path, p2, width = 7, height = 6, dpi = 150, bg = "white")
-  cat(sprintf("kernel_bw_mult plot saved to: %s\n", p2_path))
 }
 
 

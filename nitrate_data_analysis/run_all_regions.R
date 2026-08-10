@@ -52,12 +52,12 @@ area_key_map <- c(
   "South East"    = "south_east"
 )
 
-threshold_val <- log(5)
-# Must match cv_hyperparameter.R's threshold_label so this driver looks up the
-# right cv_results_<area_key>_<threshold_label>.rds, and so this run's own
-# outputs (region_result_*, plss_sf_combine_*, region_pipeline_summary,
-# sanity maps) don't collide with a different threshold's run.
-threshold_label <- paste0("log", round(exp(threshold_val), 0))
+threshold_vals <- c(log(2), log(5), log(10))  # any number of thresholds; all get run
+# Must match cv_hyperparameter.R's own threshold_label_for() so this driver
+# looks up the right cv_results_<area_key>_<threshold_label>.rds, and so this
+# run's own outputs (region_result_*, plss_sf_combine_*,
+# region_pipeline_summary, sanity maps) don't collide across thresholds.
+threshold_label_for <- function(threshold_val) paste0("log", round(exp(threshold_val), 0))
 year_filter   <- 2020
 
 # Explicit county lists for PLSS sub-setting; NULL means use the counties
@@ -166,7 +166,7 @@ run_region_pipeline <- function(area,
   # slow, and a second CV implementation that can drift out of sync with the
   # first. Failing loudly here instead keeps there being exactly one way to
   # compute CV results.
-  threshold_label <- paste0("log", round(exp(threshold_val), 0))
+  threshold_label <- threshold_label_for(threshold_val)
   cv_path <- file.path(output_dir, "hyper_parameter_cv", sprintf("cv_results_%s_%s.rds", area_key, threshold_label))
   if (!file.exists(cv_path)) {
     stop(sprintf(
@@ -224,69 +224,18 @@ run_region_pipeline <- function(area,
 
 
 # ============================================================
-# MAIN LOOP -- apply the pipeline to every region
+# MAIN LOOP -- apply the pipeline to every (threshold, region)
 # ============================================================
 # Sequential across regions (each region already parallelizes internally
 # via init_mc.cores for piece (iii)'s DC warm start); nesting mclapply at
 # both levels would oversubscribe cores. Each region's full result is
-# cached, so re-running this script after an interruption picks up
-# where it left off.
-
-region_results <- list()
-
-for (area in areas) {
-  area_key <- area_key_map[[area]]
-  result_path <- file.path(region_results_dir, sprintf("region_result_%s_%s.rds", area_key, threshold_label))
-
-  if (use_cache && file.exists(result_path)) {
-    cat(sprintf("Loading cached region result for %s...\n", area))
-    region_results[[area]] <- readRDS(result_path)
-    next
-  }
-
-  region_results[[area]] <- run_region_pipeline(
-    area = area,
-    data_all = data_all, plss_covariates_all = plss_covariates_all, output_dir = output_dir,
-    threshold_val = threshold_val,
-    plss_county_override = plss_county_override, plss_crop_exclude = plss_crop_exclude,
-    init_mc.cores = init_mc.cores,
-    use_cache = use_cache
-  )
-  saveRDS(region_results[[area]], result_path)
-}
-
-
-# ============================================================
-# COMBINE RESULTS ACROSS REGIONS
-# ============================================================
-
-plss_sf_combine_direct <- do.call(rbind, lapply(region_results, `[[`, "plss_sf_direct"))
-plss_sf_combine_indirect_nonspatial <- do.call(rbind, lapply(region_results, `[[`, "plss_sf_indirect"))
-
-saveRDS(plss_sf_combine_direct, file.path(region_results_dir, sprintf("plss_sf_combine_direct_%s.rds", threshold_label)))
-saveRDS(plss_sf_combine_indirect_nonspatial,
-        file.path(region_results_dir, sprintf("plss_sf_combine_indirect_nonspatial_%s.rds", threshold_label)))
-
-# Summary table: chosen hyperparameters + train/test metrics per region,
-# for a quick sanity check before handing off to policy_visualization.r
-summary_df <- do.call(rbind, lapply(region_results, function(r) {
-  data.frame(
-    area = r$area,
-    m = r$best_hyperparams$m, lambda = r$best_hyperparams$lambda,
-    kernel_bw_mult = r$best_hyperparams$kernel_bw_mult, cv_mcc = r$best_hyperparams$mcc,
-    direct_train_mcc = r$direct_metrics_train$mcc, direct_test_mcc = r$direct_metrics_test$mcc,
-    indirect_train_mcc = r$indirect_metrics_train$mcc, indirect_test_mcc = r$indirect_metrics_test$mcc
-  )
-}))
-rownames(summary_df) <- NULL
-saveRDS(summary_df, file.path(region_results_dir, sprintf("region_pipeline_summary_%s.rds", threshold_label)))
-print(summary_df)
-
-
-# ============================================================
-# SANITY-CHECK MAP (quick look only -- see policy_visualization.r
-# for the polished, paper-ready figures)
-# ============================================================
+# cached per threshold, so re-running this script after an interruption --
+# or after adding a new threshold to threshold_vals -- picks up where it
+# left off: already-completed (threshold, area) pairs are recognized via
+# their threshold-namespaced result_path and skipped, not recomputed.
+#
+# wi_counties.rds is threshold-independent (just Wisconsin county
+# boundaries), so it's loaded/cached once outside the threshold loop.
 
 wi_counties_path <- file.path(output_dir, "wi_counties.rds")
 if (file.exists(wi_counties_path)) {
@@ -308,9 +257,67 @@ make_sanity_map <- function(plss_sf, title_str) {
     theme_void()
 }
 
-ggsave(file.path("nitrate_data_analysis/figures", sprintf("sanity_map_direct_%s.png", threshold_label)),
-       make_sanity_map(plss_sf_combine_direct, "Direct Method"),
-       width = 8, height = 7, dpi = 200, bg = "white")
-ggsave(file.path("nitrate_data_analysis/figures", sprintf("sanity_map_indirect_nonspatial_%s.png", threshold_label)),
-       make_sanity_map(plss_sf_combine_indirect_nonspatial, "Non-Spatial Indirect Method"),
-       width = 8, height = 7, dpi = 200, bg = "white")
+for (threshold_val in threshold_vals) {
+  threshold_label <- threshold_label_for(threshold_val)
+  cat(sprintf("\n%s\n%s THRESHOLD = %s %s\n%s\n", strrep("#", 60), strrep("#", 10), threshold_label, strrep("#", 10), strrep("#", 60)))
+
+  region_results <- list()
+
+  for (area in areas) {
+    area_key <- area_key_map[[area]]
+    result_path <- file.path(region_results_dir, sprintf("region_result_%s_%s.rds", area_key, threshold_label))
+
+    if (use_cache && file.exists(result_path)) {
+      cat(sprintf("Loading cached region result for %s / %s...\n", area, threshold_label))
+      region_results[[area]] <- readRDS(result_path)
+      next
+    }
+
+    region_results[[area]] <- run_region_pipeline(
+      area = area,
+      data_all = data_all, plss_covariates_all = plss_covariates_all, output_dir = output_dir,
+      threshold_val = threshold_val,
+      plss_county_override = plss_county_override, plss_crop_exclude = plss_crop_exclude,
+      init_mc.cores = init_mc.cores,
+      use_cache = use_cache
+    )
+    saveRDS(region_results[[area]], result_path)
+  }
+
+
+  # ---- Combine results across regions, for this threshold ----
+
+  plss_sf_combine_direct <- do.call(rbind, lapply(region_results, `[[`, "plss_sf_direct"))
+  plss_sf_combine_indirect_nonspatial <- do.call(rbind, lapply(region_results, `[[`, "plss_sf_indirect"))
+
+  saveRDS(plss_sf_combine_direct, file.path(region_results_dir, sprintf("plss_sf_combine_direct_%s.rds", threshold_label)))
+  saveRDS(plss_sf_combine_indirect_nonspatial,
+          file.path(region_results_dir, sprintf("plss_sf_combine_indirect_nonspatial_%s.rds", threshold_label)))
+
+  # Summary table: chosen hyperparameters + train/test metrics per region,
+  # for a quick sanity check before handing off to policy_visualization.r
+  summary_df <- do.call(rbind, lapply(region_results, function(r) {
+    data.frame(
+      area = r$area,
+      m = r$best_hyperparams$m, lambda = r$best_hyperparams$lambda,
+      kernel_bw_mult = r$best_hyperparams$kernel_bw_mult, cv_mcc = r$best_hyperparams$mcc,
+      direct_train_mcc = r$direct_metrics_train$mcc, direct_test_mcc = r$direct_metrics_test$mcc,
+      indirect_train_mcc = r$indirect_metrics_train$mcc, indirect_test_mcc = r$indirect_metrics_test$mcc
+    )
+  }))
+  rownames(summary_df) <- NULL
+  saveRDS(summary_df, file.path(region_results_dir, sprintf("region_pipeline_summary_%s.rds", threshold_label)))
+  cat(sprintf("\n=== Summary for threshold %s ===\n", threshold_label))
+  print(summary_df)
+
+
+  # ---- Sanity-check maps for this threshold (quick look only -- see
+  # policy_visualization.r for the polished, paper-ready figures) ----
+
+  ggsave(file.path("nitrate_data_analysis/figures", sprintf("sanity_map_direct_%s.png", threshold_label)),
+         make_sanity_map(plss_sf_combine_direct, "Direct Method"),
+         width = 8, height = 7, dpi = 200, bg = "white")
+  ggsave(file.path("nitrate_data_analysis/figures", sprintf("sanity_map_indirect_nonspatial_%s.png", threshold_label)),
+         make_sanity_map(plss_sf_combine_indirect_nonspatial, "Non-Spatial Indirect Method"),
+         width = 8, height = 7, dpi = 200, bg = "white")
+}
