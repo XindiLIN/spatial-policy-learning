@@ -1,52 +1,53 @@
-library(tigris)
-library(ggplot2)
-library(tidyr)
-library(tidymodels)
 library(dplyr)
-library(patchwork)
-library(stringr)
-library(emmeans)
-library(sf)
+library(tidyr)
 
-source("functions/miscellaneous.r")
+output_dir <- "nitrate_data_analysis/output"
+area_results_dir <- file.path(output_dir, "area_results")
 
+areas <- c("central", "east_central", "north_central", "north_east", "north_west",
+           "south_central", "south_east", "south_west", "west_central")
+threshold_labels <- c("log2", "log5", "log10")
 
-# Nonsp Indirect method v.s. Our method (acc/mcc)
+# For each (area, threshold), pull the mean-of-regions metrics for direct/indirect x train/test.
+metrics_long <- lapply(threshold_labels, function(threshold_label) {
+  rows <- lapply(areas, function(area_key) {
+    path <- file.path(area_results_dir, sprintf("region_result_%s_%s.rds", area_key, threshold_label))
+    if (!file.exists(path)) return(NULL)
+    r <- readRDS(path)
+    bind_rows(
+      as_tibble(r$direct_metrics_train)   %>% mutate(area_key = area_key, threshold_label = threshold_label, method = "Our Method",  split = "Training"),
+      as_tibble(r$direct_metrics_test)    %>% mutate(area_key = area_key, threshold_label = threshold_label, method = "Our Method",  split = "Test"),
+      as_tibble(r$indirect_metrics_train) %>% mutate(area_key = area_key, threshold_label = threshold_label, method = "Non-spatial", split = "Training"),
+      as_tibble(r$indirect_metrics_test)  %>% mutate(area_key = area_key, threshold_label = threshold_label, method = "Non-spatial", split = "Test")
+    )
+  })
+  bind_rows(rows)
+}) %>% bind_rows()
 
-policy_comparison_combine <- readRDS("nitrate_data_analysis/output/policy_comparison_combine.rds")
+# Average across regions (dropping NA MCC folds, e.g. indirect method's boundary-clamp
+# collapse at log10 for some regions -- see East Central at log10 for the clearest case).
+metrics_summary <- metrics_long %>%
+  group_by(threshold_label, method, split) %>%
+  summarise(
+    n_regions_mcc = sum(!is.na(mcc)),
+    acc = mean(acc, na.rm = TRUE),
+    mcc = mean(mcc, na.rm = TRUE),
+    two_sided_f1 = mean(two_sided_f1, na.rm = TRUE),
+    .groups = "drop"
+  )
 
-policy_comparison_combine_sf <- st_as_sf(policy_comparison_combine, coords = c("longitude", "latitude"), crs = 4326)
-policy_comparison_combine_sf_test <- policy_comparison_combine_sf[policy_comparison_combine_sf$test == 1, ]
+print(metrics_summary, n = Inf)
 
-train_nonspatial <- calculate_acc_mcc_two_sided_f1(T = log(policy_comparison_combine_sf$WellDepth),
-                                                   Y = log(policy_comparison_combine_sf$concentration_plus_median),
-                                                   policy = policy_comparison_combine_sf$indirect_policy,
-                                                   threshold_val = log(5))
+# Wide table matching the paper's presentation: rows = metric, columns = threshold x method x split
+metrics_wide <- metrics_summary %>%
+  pivot_longer(cols = c(acc, mcc, two_sided_f1), names_to = "metric", values_to = "value") %>%
+  mutate(
+    metric = recode(metric, acc = "Accuracy", mcc = "MCC", two_sided_f1 = "Two-sided F1"),
+    threshold_label = factor(threshold_label, levels = c("log2", "log5", "log10"))
+  ) %>%
+  select(threshold_label, metric, method, split, value) %>%
+  pivot_wider(names_from = c(threshold_label, split, method), values_from = value)
 
-test_nonspatial <- calculate_acc_mcc_two_sided_f1(T = log(policy_comparison_combine_sf_test$WellDepth),
-                                                  Y = log(policy_comparison_combine_sf_test$concentration_plus_median),
-                                                  policy = policy_comparison_combine_sf_test$indirect_policy,
-                                                  threshold_val = log(5))
+print(metrics_wide)
 
-train_our_method <- calculate_acc_mcc_two_sided_f1(T = log(policy_comparison_combine_sf$WellDepth),
-                                                   Y = log(policy_comparison_combine_sf$concentration_plus_median),
-                                                   policy = policy_comparison_combine_sf$policy,
-                                                   threshold_val = log(5))
-
-test_our_method <- calculate_acc_mcc_two_sided_f1(T = log(policy_comparison_combine_sf_test$WellDepth),
-                                                  Y = log(policy_comparison_combine_sf_test$concentration_plus_median),
-                                                  policy = policy_comparison_combine_sf_test$policy,
-                                                  threshold_val = log(5))
-
-# assemble into one table: rows = metric, columns = method x train/test
-metrics_comparison <- data.frame(
-  Metric = c("Two-sided F1", "MCC", "Accuracy"),
-  Training_Nonspatial = c(train_nonspatial$two_sided_f1, train_nonspatial$mcc, train_nonspatial$acc),
-  Training_OurMethod = c(train_our_method$two_sided_f1, train_our_method$mcc, train_our_method$acc),
-  Test_Nonspatial = c(test_nonspatial$two_sided_f1, test_nonspatial$mcc, test_nonspatial$acc),
-  Test_OurMethod = c(test_our_method$two_sided_f1, test_our_method$mcc, test_our_method$acc)
-)
-metrics_comparison[, -1] <- round(metrics_comparison[, -1], 3)
-
-print(metrics_comparison)
-
+saveRDS(metrics_summary, file.path(output_dir, "area_results", "policy_metrics_comparison_summary.rds"))

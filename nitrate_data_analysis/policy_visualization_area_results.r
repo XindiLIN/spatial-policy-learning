@@ -17,9 +17,10 @@ source("functions/miscellaneous.r")
 
 region_results_dir  <- "nitrate_data_analysis/output/area_results"
 wi_counties_path     <- "nitrate_data_analysis/output/wi_counties.rds"
+threshold_label      <- "log5"
 
-plss_direct   <- readRDS(file.path(region_results_dir, "plss_sf_combine_direct.rds"))
-plss_indirect <- readRDS(file.path(region_results_dir, "plss_sf_combine_indirect_nonspatial.rds"))
+plss_direct   <- readRDS(file.path(region_results_dir, sprintf("plss_sf_combine_direct_%s.rds", threshold_label)))
+plss_indirect <- readRDS(file.path(region_results_dir, sprintf("plss_sf_combine_indirect_nonspatial_%s.rds", threshold_label)))
 
 # Both are built from the same prep$plss per region (see run_all_regions.R's
 # run_region_pipeline()), so they should already be in 1:1 row correspondence --
