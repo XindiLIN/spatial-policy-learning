@@ -17,7 +17,12 @@ source("functions/miscellaneous.r")
 
 region_results_dir  <- "nitrate_data_analysis/output/area_results"
 wi_counties_path     <- "nitrate_data_analysis/output/wi_counties.rds"
-threshold_label      <- "log5"
+# Pass a threshold label (e.g. "log2", "log10") as a command-line arg to
+# generate the appendix's other-threshold figures instead of the main
+# text's log5 ones -- e.g. `Rscript ... log10`. Defaults to "log5" (the
+# main-text figures) when run with no args, as before.
+cli_args        <- commandArgs(trailingOnly = TRUE)
+threshold_label <- if (length(cli_args) >= 1) cli_args[1] else "log5"
 
 plss_direct   <- readRDS(file.path(region_results_dir, sprintf("plss_sf_combine_direct_%s.rds", threshold_label)))
 plss_indirect <- readRDS(file.path(region_results_dir, sprintf("plss_sf_combine_indirect_nonspatial_%s.rds", threshold_label)))
@@ -285,11 +290,16 @@ print(drainage_plot)
 # Save
 # ============================================================
 
-ggsave("nitrate_data_analysis/figures/fig1_map_combined.png", plot = combined_map_plot,
+# log5 keeps the original unsuffixed filenames used by the main text's
+# Results subsection; other thresholds get their own suffixed files for
+# the appendix (sec:additional_details) instead.
+fig_suffix <- if (threshold_label == "log5") "" else paste0("_", threshold_label)
+
+ggsave(sprintf("nitrate_data_analysis/figures/fig1_map_combined%s.png", fig_suffix), plot = combined_map_plot,
        width = 14, height = 6, dpi = 300, bg = "white")
 
-ggsave("nitrate_data_analysis/figures/fig2_marginal_land_use.png", plot = crop_marginal_plot,
+ggsave(sprintf("nitrate_data_analysis/figures/fig2_marginal_land_use%s.png", fig_suffix), plot = crop_marginal_plot,
        width = 10, height = 5, dpi = 300, bg = "white")
 
-ggsave("nitrate_data_analysis/figures/fig3_marginal_drainage.png", plot = drainage_plot,
+ggsave(sprintf("nitrate_data_analysis/figures/fig3_marginal_drainage%s.png", fig_suffix), plot = drainage_plot,
        width = 10, height = 5, dpi = 300, bg = "white")
