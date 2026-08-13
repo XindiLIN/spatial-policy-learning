@@ -53,7 +53,7 @@ abs_error_boxplot <- ggplot(df_diff) +
 print(abs_error_boxplot)
 
 dir.create("simulation/figures", recursive = TRUE, showWarnings = FALSE)
-ggsave("simulation/figures/simulation_error.png", plot = abs_error_boxplot,
+ggsave("simulation/figures/simulation_error_boxplot.png", plot = abs_error_boxplot,
        width = 9.5, height = 3.6, dpi = 300, bg = "white")
 
 
