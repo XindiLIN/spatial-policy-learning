@@ -29,17 +29,18 @@ df_diff <- estimated_policy_all %>%
   ) %>%
   mutate(method = gsub("diff_", "", method))
 
-ggplot(df_diff) +
-  geom_boxplot(aes(x = threshold_quantile, y = abs_error, fill = method,
+abs_error_boxplot <- ggplot(df_diff) +
+  geom_boxplot(aes(x = threshold_quantile, y = log(abs_error+1), fill = method,
                    group = interaction(threshold_quantile, method))) +
-  coord_cartesian(ylim = c(0, 6)) +
+  coord_cartesian(ylim = c(0, 2.2)) +
   scale_x_continuous(
     name = "Threshold Quantile", # Change the X-axis title here
     breaks = c(0.4,0.5,0.6))+
   scale_y_continuous(
-    name = "ABsolute Error", # Change the X-axis title here
-    breaks = c(0,2,5),
-    limits = c(0,6))+
+    name = "Log Absolute Error", # Change the X-axis title here
+    # breaks = c(0,2,5),
+    # limits = c(0,6)
+    )+
   theme_bw() +
   scale_fill_brewer(palette = "Set2") +
   scale_fill_manual(labels = c("direct" = "Direct", # "indirect" = "Indirect",
@@ -49,11 +50,16 @@ ggplot(df_diff) +
                                "indirect_nonsp" = "#FDBF6F"),
                     name = "Estimation Method")
 
+print(abs_error_boxplot)
+
+dir.create("simulation/figures", recursive = TRUE, showWarnings = FALSE)
+ggsave("simulation/figures/simulation_error.png", plot = abs_error_boxplot,
+       width = 9.5, height = 3.6, dpi = 300, bg = "white")
+
+
 # draw the binary classification metrics, for every method and every quantile, we get a metrics
 
 data_test_all <- bind_rows(data_test_lst)
-
-
 
 estimated_policy_all_wider <- estimated_policy_all %>%
   # Pivot wide to get columns: direct, indirect, indirect_nonsp, optimal
@@ -97,7 +103,7 @@ metric_labs <- c(
 )
 
 metrics_plot <- ggplot(df_long, aes(x = threshold_quantile, y = value, color = method)) +
-  geom_line(size = 1) +
+  geom_line(linewidth = 1) +
   geom_point(size = 2) +
   facet_wrap(~ metric, scales = "free_y", labeller = labeller(metric = metric_labs)) +  # 'scales = "free_y"' allows y-axis to vary per plot
   labs(x = "Threshold Quantile") +
@@ -108,11 +114,12 @@ metrics_plot <- ggplot(df_long, aes(x = threshold_quantile, y = value, color = m
                               "indirect_nonsp" = "#FDBF6F",
                               "optimal" = "purple"),
                    name = "Estimation Method") +
-  theme(axis.title.y = element_blank(),
-        axis.text.x = element_text(size = 8))
+  theme(axis.title.y = element_blank()
+        )
 
 print(metrics_plot)
 
 dir.create("simulation/figures", recursive = TRUE, showWarnings = FALSE)
-ggsave("simulation/figures/simulation_metrics_updated.png", plot = metrics_plot,
-       width = 1896, height = 586, units = "px", dpi = 300, bg = "white")
+ggsave("simulation/figures/simulation_metrics.png", plot = metrics_plot,
+       width = 10, height = 3, dpi = 300, bg = "white")
+ 
