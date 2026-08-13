@@ -92,16 +92,15 @@ df_long <- performance_metrics %>%
 
 metric_labs <- c(
   acc = "Accuracy",
-  two_sided_f1 = "Aggregated F1",
+  two_sided_f1 = "Two-sided F1",
   mcc = "MCC"
 )
 
-ggplot(df_long, aes(x = threshold_quantile, y = value, color = method)) +
+metrics_plot <- ggplot(df_long, aes(x = threshold_quantile, y = value, color = method)) +
   geom_line(size = 1) +
   geom_point(size = 2) +
   facet_wrap(~ metric, scales = "free_y", labeller = labeller(metric = metric_labs)) +  # 'scales = "free_y"' allows y-axis to vary per plot
-  labs(title = "Performance Metrics by Threshold Quantile",
-       x = "Threshold Quantile") +
+  labs(x = "Threshold Quantile") +
   scale_color_manual(labels = c("direct" = "Direct", # "indirect" = "Indirect",
                                 "indirect_nonsp" = "Non-spatial Indirect", "optimal" = "True"),
                    values = c("direct" = "#F8766D",
@@ -109,4 +108,11 @@ ggplot(df_long, aes(x = threshold_quantile, y = value, color = method)) +
                               "indirect_nonsp" = "#FDBF6F",
                               "optimal" = "purple"),
                    name = "Estimation Method") +
-  theme_minimal()
+  theme(axis.title.y = element_blank(),
+        axis.text.x = element_text(size = 8))
+
+print(metrics_plot)
+
+dir.create("simulation/figures", recursive = TRUE, showWarnings = FALSE)
+ggsave("simulation/figures/simulation_metrics_updated.png", plot = metrics_plot,
+       width = 1896, height = 586, units = "px", dpi = 300, bg = "white")
