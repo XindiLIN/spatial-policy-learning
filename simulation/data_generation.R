@@ -41,6 +41,7 @@ data_generation_general <- function(d = 50,
                                     gp_model_U = "matern_isotropic",
                                     spatial_dependence = TRUE,
                                     spatial_confounding = FALSE,
+                                    trunc_sd = 3,        # truncate U, X1, X2, and the noises at trunc_sd standard deviations
                                     seed = 1998) {
   
   set.seed(seed)
@@ -51,9 +52,12 @@ data_generation_general <- function(d = 50,
   grd <- expand.grid(coord_x = grid_x, coord_y = grid_y)
   
   # --- 2. Generate covariates ---
-  X <- covariate_fun(grd)
+  X <- covariate_fun(grd, trunc_sd = trunc_sd)
   if(spatial_dependence){
     U <- fast_Gp_sim(gp_params_U, gp_model_U,  locs = grd, 30 )  
+    # bounded spatial process: symmetric truncation keeps U mean-zero
+    U_bound <- trunc_sd * sqrt(gp_params_U[1])
+    U <- pmax(pmin(U, U_bound), -U_bound)
   } else {
     U <- rep(0, nrow(grd))
   }
@@ -67,11 +71,11 @@ data_generation_general <- function(d = 50,
     mu_T <- treatment_mean(X = X, U = NULL)  
   }
   
-  T <- treatment_fun(mu_T = mu_T, locs = grd)
+  T <- treatment_fun(mu_T = mu_T, locs = grd, trunc_sd = trunc_sd)
   
   # --- 4. Generate regression mean using user-supplied function ---
   mu_Y <- outcome_mean(X = X, T = T, U = U)
-  Y <- outcome_fun(mu_Y = mu_Y, locs = grd)
+  Y <- outcome_fun(mu_Y = mu_Y, locs = grd, trunc_sd = trunc_sd)
   
   # --- 7. Return data.frame ---
   data <- list(grd = grd, X = X[,c("X1", "X2", "X3", "X4")], U = U,  mu_T = mu_T, T = T, mu_Y = mu_Y, Y = Y)
@@ -86,13 +90,17 @@ data_generation_general <- function(d = 50,
 # Generate Covariate
 # two of them are continuous
 # two of them are normally distributed
-covariate_fun <- function(grd, gp_params = c(1,0.2,0.5,0)){
+covariate_fun <- function(grd, gp_params = c(1,0.2,0.5,0), trunc_sd = Inf){
   
   # c(variance, range, smoothness, nugget)
   
   # generate continuous 
   X1 <- fast_Gp_sim(gp_params, "matern_isotropic",  locs = grd, 30 )
   X2 <- fast_Gp_sim(gp_params, "matern_isotropic",  locs = grd, 30 )
+  # bounded continuous covariates
+  X_bound <- trunc_sd * sqrt(gp_params[1])
+  X1 <- pmax(pmin(X1, X_bound), -X_bound)
+  X2 <- pmax(pmin(X2, X_bound), -X_bound)
   # generate categorical
   categories = 1:4
   
@@ -139,7 +147,8 @@ treatment_mean <- function(X, U = NULL,
 treatment_fun <- function(mu_T,
                           locs,
                           id_sd = 0.5,
-                          treatment_range = c(-4,4)) {
+                          treatment_range = c(-4,4),
+                          trunc_sd = Inf) {
   
   n <- nrow(locs)
   # GP noise
@@ -147,6 +156,7 @@ treatment_fun <- function(mu_T,
   
   # i.i.d. noise
   T_noise <- rnorm(n, mean = 0, sd = id_sd)
+  T_noise <- pmax(pmin(T_noise, trunc_sd * id_sd), -trunc_sd * id_sd)
   
   # Final treatment
   T <- mu_T + T_noise 
@@ -248,11 +258,13 @@ outcome_mean_nonlinear_derivative <- function(X, T, U,
 
 outcome_fun <- function(mu_Y,
                         locs,
-                        id_sd = 1) {
+                        id_sd = 1,
+                        trunc_sd = Inf) {
   n <- nrow(locs)
   
   # i.i.d. noise
   Y_noise <- rnorm(n, mean = 0, sd = id_sd)
+  Y_noise <- pmax(pmin(Y_noise, trunc_sd * id_sd), -trunc_sd * id_sd)
   
   # Observed outcome
   Y <- mu_Y + Y_noise 

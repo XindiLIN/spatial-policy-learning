@@ -88,6 +88,66 @@ get_SVM_cv_residuals <- function(x,y,seed_value = 1998, fold = 5){
 }
 
 
+# get_generalized_propensity <- function(GPS_covariate_names = c("StaticLevel","crop_type_combine","drainagecl","precipitation","cafolog"),
+#                                        data,krige_values){
+#   
+#   treatment_mean_model <- SuperLearner(
+#     Y = data$logWellDepth,
+#     X = cbind(data[,GPS_covariate_names], 
+#               U = krige_values), # notice that we might add U
+#     family = gaussian(),
+#     SL.library = c("SL.ranger")
+#   )
+#   
+#   treatment_sd = sd(data$logWellDepth - treatment_mean_model$Z)
+#   gps_est <- dnorm(treatment_mean_model$Z, mean = treatment_mean_model$SL.predict, sd = treatment_sd)
+#   gps_est <- pmax(gps_est, 0.02)
+#   return(list(treatment_mean_model = treatment_mean_model,
+#               treatment_sd = treatment_sd,
+#               gps_est = gps_est))
+# }
+
+
+# x is the design matrix, y is the response
+get_SVM_cv_residuals <- function(x,y,seed_value = 1998, fold = 5){
+  # Setup Cross-Validation
+  k <- fold  # Number of folds
+  n <- nrow(x)
+  set.seed(seed_value) # For reproducibility
+  
+  # Create random folds
+  # 'folds' is a list where each element contains the indices for that fold
+  folds <- split(sample(1:n), rep(1:k, length.out = n))
+  
+  # Initialize a vector to store CV predictions (same length as data)
+  cv_preds <- numeric(n)
+  
+  # 3. Run the Loop
+  for(i in 1:k) {
+    test_indices <- folds[[i]]
+    
+    # Split data
+    x_train <- x[-test_indices, ]
+    x_test <- x[test_indices, ]
+    
+    y_train <- y[-test_indices]
+    y_test <- y[test_indices]
+    
+    # Train SVM on training set
+    # type="eps-regression" is standard for continuous outcomes
+    # model <- svm(mpg ~ ., data = train_data, type = "eps-regression")
+    model <- svm(x = x_train, y = y_train, type='eps-regression')
+    
+    # Predict on held-out test set
+    cv_preds[test_indices] <- predict(model, newdata = x_test)
+  }
+  
+  # 4. Calculate Cross-Validated Residuals
+  # Residual = Observed - Predicted
+  cv_residuals <- y - cv_preds
+}
+
+
 # using spatial mixed effect model to estimate propensity is much better (in terms of the distribution of the residual, looks more i.i.d.)
 # Also, it make more sense and align with two stage estimator for geo-referenced paper
 propensity_SVM_regresion <- function(GPS_covariate_names = c("StaticLevel","crop_type_combine","drainagecl","precipitation","cafolog"),
@@ -137,7 +197,7 @@ propensity_SVM_regresion <- function(GPS_covariate_names = c("StaticLevel","crop
 # get_generalized_propensity <- function(GPS_covariate_names = c("StaticLevel","crop_type_combine","drainagecl","precipitation","cafolog"),
 #                                       data){
 #   
-#   # # according to our assumption, we should use svm rather than random forest, so we use the function propensity_SVM_regresion()
+#   # # according to our assumption, we should use svm rather than random forest, so we use an SVM regression
 #   gps_mean_model <- SuperLearner(
 #     Y = data$logWellDepth,
 #     X = data[, GPS_covariate_names],
@@ -325,22 +385,27 @@ outcome_regression_SVM <- function(data,data_test = NULL, tunning = FALSE,
                                covfun_name = "matern_sphere",
                                convtol = 1e-03)
   
+  # clipping level M_clip = 3 * SD(residuals)
+  clip_level <- get_clip_level(svm_auto$residuals)
   krige_values_RKHS <- leave_one_out_kriging(locs = data[,c("longitude", "latitude")], 
                                              y_obs = svm_auto$residuals, 
                                              gp_model = gpfit_RKHS$covfun_name,
                                              gp_params = gpfit_RKHS$covparms,
-                                             order = c("coordinate")) 
+                                             order = c("coordinate"),
+                                             clip_level = clip_level) 
   
   pred <- predict(svm_auto, newdata = design_matrix)
   if(is.null(data_test)){
     krige_values_test_RKHS <- NULL
     pred_test <- NULL
+    design_matrix_test <- NULL
   } else {
     design_matrix_test   <- bake(rec, new_data = data_test[, OR_covariate_names])
     pred_test <- predict(svm_auto, newdata = design_matrix_test)
-    krige_values_test_RKHS <- GpGp::predictions(fit = gpfit_RKHS, 
-                                                locs_pred = data_test[,c("longitude", "latitude")], 
-                                                X_pred = rep(1,nrow(data_test)))
+    krige_values_test_RKHS <- clip_U(GpGp::predictions(fit = gpfit_RKHS, 
+                                                       locs_pred = data_test[,c("longitude", "latitude")], 
+                                                       X_pred = rep(1,nrow(data_test))),
+                                     clip_level)
   }
   
   
@@ -348,6 +413,7 @@ outcome_regression_SVM <- function(data,data_test = NULL, tunning = FALSE,
               pred = pred, pred_test = pred_test, 
               krige_values = krige_values_RKHS, 
               krige_values_test = krige_values_test_RKHS,
+              clip_level = clip_level,
               design_matrix = design_matrix,
               design_matrix_test = design_matrix_test))
 }

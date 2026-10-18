@@ -81,10 +81,17 @@ fit_region_base <- function(data_split, area_key, output_dir,
   dir.create(smoothers_dir, recursive = TRUE, showWarnings = FALSE)
 
   outcome_reg_path <- file.path(outcome_reg_dir, sprintf("outcome_regression_%s.rds", area_key))
+  outcome_reg <- NULL
   if (use_cache && file.exists(outcome_reg_path)) {
     cat("Loading cached outcome regression...\n")
     outcome_reg <- readRDS(outcome_reg_path)
-  } else {
+    # caches written before clipping was added lack clip_level; refit them
+    if (is.null(outcome_reg$clip_level)) {
+      cat("Cached outcome regression has no clipping level; refitting...\n")
+      outcome_reg <- NULL
+    }
+  }
+  if (is.null(outcome_reg)) {
     cat("Fitting outcome regression...\n")
     outcome_reg <- outcome_regression_SVM(
       data      = data_split$data,
@@ -104,9 +111,13 @@ fit_region_base <- function(data_split, area_key, output_dir,
 
   depth_range <- c(min(data_split$data$logWellDepth), max(data_split$data$logWellDepth))
 
+  # the propensity model conditions on (X, U(S)), so include the clipped
+  # leave-one-out kriging estimate U_hat as a covariate
+  data_cbps <- data_split$data
+  data_cbps$U_hat <- outcome_reg$krige_values
   weights_cbps <- weightit(
-    logWellDepth ~ StaticLevel + crop_type_combine + drainagecl + precipitation + cafolog,
-    data = data_split$data, method = "cbps"
+    logWellDepth ~ StaticLevel + crop_type_combine + drainagecl + precipitation + cafolog + U_hat,
+    data = data_cbps, method = "cbps"
   )
 
   # Silverman's rule-of-thumb bandwidth -- used as the direct method's
@@ -314,11 +325,11 @@ prep_direct_method_inputs <- function(data_split, region_base, kdm_info, m, kern
   }
 
   # Spatial random effect (kriging) at PLSS locations
-  plss_krige <- GpGp::predictions(
+  plss_krige <- clip_U(GpGp::predictions(
     fit       = outcome_reg$gpfit,
     locs_pred = plss[, c("longitude", "latitude")],
     X_pred    = rep(1, nrow(plss))
-  )
+  ), outcome_reg$clip_level)
   plss$U <- plss_krige
 
   plss_kdm <- bake(rec, new_data = plss[, RKHS_covariate_names])

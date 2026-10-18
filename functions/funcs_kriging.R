@@ -1,5 +1,17 @@
 library(GpGp)
 
+# Clip the estimated spatial effect to [-clip_level, clip_level].
+clip_U <- function(u, clip_level = Inf) {
+  pmax(pmin(u, clip_level), -clip_level)
+}
+
+# Data-driven clipping level M_clip: k times the SD of the outcome residuals.
+# Since the residual is U + epsilon (+ regression error), its SD is at least
+# SD(U), so this conservatively bounds |U| and clipping rarely binds.
+get_clip_level <- function(resid, k = 3) {
+  k * sd(resid)
+}
+
 permute_data = function(item,index){
   if (is.matrix(item)) {
     # If it's a matrix, subset the specified rows
@@ -45,7 +57,7 @@ precision_column_calculation = function(col_index, Linv, NNarray){
 
 # the data has to be ordered before 
 # y_obs is the residuals of fitted outcome that is used to do kriging
-leave_one_out_kriging = function(locs, y_obs, gp_model, gp_params, order = c("coordinate", "maxmin")){
+leave_one_out_kriging = function(locs, y_obs, gp_model, gp_params, order = c("coordinate", "maxmin"), clip_level = Inf){
   
   n = nrow(locs)
   locs = as.matrix(locs)
@@ -91,5 +103,5 @@ leave_one_out_kriging = function(locs, y_obs, gp_model, gp_params, order = c("co
   inv_ord[ord] <- 1:n
   y_pred <- permute_data(y_pred, inv_ord)
   
-  return(y_pred)
+  return(clip_U(y_pred, clip_level))
 }

@@ -38,13 +38,16 @@ outcome_mean_nonsp_model <- SuperLearner(
 
 outcome_resid <- data$Y - outcome_mean_nonsp_model$Z[,1]
 resid_Gp <- GpGp::fit_model(y = outcome_resid, locs = data$grd, silent = TRUE,convtol = 1e-03)
+# clipping level M_clip = 3 * SD(residuals)
+clip_level <- get_clip_level(outcome_resid)
 krige_values <- leave_one_out_kriging(locs = data$grd,
                                       y_obs = outcome_resid,
                                       gp_model = resid_Gp$covfun_name,
                                       gp_params = resid_Gp$covparms,
-                                      order = c("coordinate"))
+                                      order = c("coordinate"),
+                                      clip_level = clip_level)
 
-krige_values_test <- GpGp::predictions(fit = resid_Gp, locs_pred = data_test$grd, X_pred = rep(1,nrow(data_test$grd)))
+krige_values_test <- clip_U(GpGp::predictions(fit = resid_Gp, locs_pred = data_test$grd, X_pred = rep(1,nrow(data_test$grd))), clip_level)
 
 treatment_mean_model <- SuperLearner(
   Y = data$T,
