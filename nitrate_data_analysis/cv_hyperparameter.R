@@ -60,7 +60,9 @@ mc.cores <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", unset = NA))
 if (is.na(mc.cores)) mc.cores <- max(1, parallel::detectCores() - 1)
 
 # Hyperparameter grid
-m_grid       <- c(-3, -2, -1.5, -1, 0, 0.5)
+# extended after the first run picked m = -3 (lower edge) for 6 of 27 region-threshold
+# pairs and m = 0.5 (upper edge) for 1; finished tasks are skipped, so only the new m run
+m_grid       <- c(-5, -4, -3, -2, -1.5, -1, 0, 0.5, 1)
 lambda_grid  <- c(0.1, 0.25, 0.5, 1.0)
 bw_mult_grid <- c(0.5, 1, 2, 5, 10)
 
