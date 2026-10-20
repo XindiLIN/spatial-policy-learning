@@ -303,3 +303,23 @@ ggsave(sprintf("nitrate_data_analysis/figures/fig2_marginal_land_use%s.png", fig
 
 ggsave(sprintf("nitrate_data_analysis/figures/fig3_marginal_drainage%s.png", fig_suffix), plot = drainage_plot,
        width = 10, height = 5, dpi = 300, bg = "white")
+
+# Figures 2 and 3 side by side as panels A and B (used in the JRSSB version).
+# Category names go on the x-axis, so the color legends are dropped, and the
+# single Method legend from panel B is placed below both panels.
+crop_panel <- crop_marginal_plot +
+  scale_x_discrete(labels = c("Corn", "Soybeans", "Grass", "Vegetables", "Developed", "Forest")) +
+  guides(color = "none", shape = "none") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+drainage_panel <- drainage_plot +
+  scale_x_discrete(labels = c("Very poor", "Poor", "Somewhat poor", "Moderately well",
+                              "Well", "Somewhat excessive", "Excessive")) +
+  guides(color = "none") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+marginal_combined_plot <- (crop_panel | drainage_panel) +
+  plot_annotation(tag_levels = "A") +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom", plot.tag = element_text(size = 16, face = "bold"))
+
+ggsave(sprintf("nitrate_data_analysis/figures/fig23_marginal_combined%s.png", fig_suffix), plot = marginal_combined_plot,
+       width = 13, height = 5.5, dpi = 300, bg = "white")
